@@ -14,7 +14,7 @@ import aiohttp
 from aiohttp import web
 
 # ============================================================
-# Ahmed Order Flow Intelligence Pro v9
+# Ahmed Order Flow Intelligence Pro v10
 # Binance USDT-M Futures -> Telegram
 # 15m / 1h / 4h | Bullish OF / Bearish OF only
 # ============================================================
@@ -26,7 +26,7 @@ TF_LABEL = {"15m": "15 دقيقة", "1h": "ساعة", "4h": "4 ساعات"}
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "85"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "75"))
 SEND_TEST_MESSAGES = os.getenv("SEND_TEST_MESSAGES", "true").lower() == "true"
 MIN_STRONG_FACTORS = int(os.getenv("MIN_STRONG_FACTORS", "4"))
 COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "12"))
@@ -44,6 +44,7 @@ HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "99"))
 REST_CONCURRENCY = int(os.getenv("REST_CONCURRENCY", "2"))
 REST_GAP = float(os.getenv("REST_GAP", "0.45"))
 STREAMS_PER_WS = int(os.getenv("STREAMS_PER_WS", "180"))
+FIRST_LIVE_TOUCH_ONLY = os.getenv("FIRST_LIVE_TOUCH_ONLY", "true").lower() == "true"
 
 REST_BASES = [
     "https://fapi.binance.com",
@@ -113,6 +114,7 @@ class ZoneState:
     bull_broken: bool = True
     bull_inside: bool = False
     bull_tests: int = 0
+    bull_live_tests: int = 0
 
     bear_top: Optional[float] = None
     bear_bottom: Optional[float] = None
@@ -122,6 +124,7 @@ class ZoneState:
     bear_broken: bool = True
     bear_inside: bool = False
     bear_tests: int = 0
+    bear_live_tests: int = 0
 
 
 @dataclass
@@ -423,14 +426,16 @@ def apply_bar(c: List[Candle], i: int, s: ZoneState, emit: bool) -> List[dict]:
         if s.bull_detected_index is None or i > s.bull_detected_index:
             s.bull_tests += 1
             if emit:
+                s.bull_live_tests += 1
                 TOUCH_COUNT += 1
-                out.append({"side": "bull", "bottom": s.bull_bottom, "top": s.bull_top, "tests": s.bull_tests, "created": s.bull_created, "created_index": s.bull_created_index})
+                out.append({"side": "bull", "bottom": s.bull_bottom, "top": s.bull_top, "tests": s.bull_live_tests if FIRST_LIVE_TOUCH_ONLY else s.bull_tests, "historical_tests": s.bull_tests, "created": s.bull_created, "created_index": s.bull_created_index})
     if inside_bear and not s.bear_inside:
         if s.bear_detected_index is None or i > s.bear_detected_index:
             s.bear_tests += 1
             if emit:
+                s.bear_live_tests += 1
                 TOUCH_COUNT += 1
-                out.append({"side": "bear", "bottom": s.bear_bottom, "top": s.bear_top, "tests": s.bear_tests, "created": s.bear_created, "created_index": s.bear_created_index})
+                out.append({"side": "bear", "bottom": s.bear_bottom, "top": s.bear_top, "tests": s.bear_live_tests if FIRST_LIVE_TOUCH_ONLY else s.bear_tests, "historical_tests": s.bear_tests, "created": s.bear_created, "created_index": s.bear_created_index})
     s.bull_inside, s.bear_inside = inside_bull, inside_bear
 
     if not s.bull_broken and s.bull_bottom is not None and (current.close if BREAK_BY_CLOSE else current.low) < s.bull_bottom:
@@ -448,7 +453,7 @@ async def handle_touch(symbol: str, tf: str, c: List[Candle], event: dict) -> No
     if time.time() - LAST_TOUCH_AT.get(touch_key, 0) < 30:
         return
     LAST_TOUCH_AT[touch_key] = time.time()
-    log.info("TOUCH_DETECTED symbol=%s tf=%s side=%s test=%s zone=%s-%s", symbol, tf, side, event["tests"], fmt(float(event["bottom"])), fmt(float(event["top"])))
+    log.info("TOUCH_DETECTED symbol=%s tf=%s side=%s live_test=%s historical_test=%s zone=%s-%s", symbol, tf, side, event["tests"], event.get("historical_tests", event["tests"]), fmt(float(event["bottom"])), fmt(float(event["top"])))
     if event["tests"] != 1:
         REJECT_COUNT += 1
         REJECT_REASONS["second_touch"] += 1
@@ -700,12 +705,14 @@ async def process_live_price(symbol: str, price: float) -> None:
             was_inside = state.bull_inside
             if inside and not was_inside:
                 state.bull_tests += 1
+                state.bull_live_tests += 1
                 TOUCH_COUNT += 1
                 events.append({
                     "side": "bull",
                     "bottom": state.bull_bottom,
                     "top": state.bull_top,
-                    "tests": state.bull_tests,
+                    "tests": state.bull_live_tests if FIRST_LIVE_TOUCH_ONLY else state.bull_tests,
+                    "historical_tests": state.bull_tests,
                     "created": state.bull_created,
                     "created_index": state.bull_created_index,
                 })
@@ -716,12 +723,14 @@ async def process_live_price(symbol: str, price: float) -> None:
             was_inside = state.bear_inside
             if inside and not was_inside:
                 state.bear_tests += 1
+                state.bear_live_tests += 1
                 TOUCH_COUNT += 1
                 events.append({
                     "side": "bear",
                     "bottom": state.bear_bottom,
                     "top": state.bear_top,
-                    "tests": state.bear_tests,
+                    "tests": state.bear_live_tests if FIRST_LIVE_TOUCH_ONLY else state.bear_tests,
+                    "historical_tests": state.bear_tests,
                     "created": state.bear_created,
                     "created_index": state.bear_created_index,
                 })
@@ -766,9 +775,11 @@ def preserve_zone_runtime(old: ZoneState, fresh: ZoneState) -> ZoneState:
     """Keep first-touch counters when the same zone survives a candle refresh."""
     if old.bull_created is not None and old.bull_created == fresh.bull_created:
         fresh.bull_tests = old.bull_tests
+        fresh.bull_live_tests = old.bull_live_tests
         fresh.bull_inside = old.bull_inside
     if old.bear_created is not None and old.bear_created == fresh.bear_created:
         fresh.bear_tests = old.bear_tests
+        fresh.bear_live_tests = old.bear_live_tests
         fresh.bear_inside = old.bear_inside
     return fresh
 
@@ -844,7 +855,7 @@ async def test_messages(symbol_count: int) -> None:
 def stats_payload() -> dict:
     return {
         "ok": True,
-        "version": "v9",
+        "version": "v10",
         "states": len(STATES),
         "raw_ws_messages": RAW_WS_COUNT,
         "ws_errors": WS_ERROR_COUNT,
@@ -866,6 +877,7 @@ def stats_payload() -> dict:
         "telegram_configured": bool(BOT_TOKEN and CHAT_ID),
         "minimum_score": MIN_SCORE,
         "minimum_strong_factors": MIN_STRONG_FACTORS,
+        "first_live_touch_only": FIRST_LIVE_TOUCH_ONLY,
     }
 
 async def health(_: web.Request) -> web.Response:
@@ -873,7 +885,7 @@ async def health(_: web.Request) -> web.Response:
 
 async def stats(_: web.Request) -> web.Response:
     data = stats_payload()
-    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v9</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
+    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v10</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
     return web.Response(text=html, content_type="text/html")
 
 
