@@ -15,7 +15,7 @@ import aiohttp
 from aiohttp import web
 
 # ============================================================
-# Ahmed Order Flow Intelligence Pro v13.2
+# Ahmed Order Flow Intelligence Pro v14
 # Binance USDT-M Futures -> Telegram
 # 15m / 1h / 4h | Bullish OF / Bearish OF only
 # ============================================================
@@ -55,6 +55,10 @@ REQUIRE_STRUCTURE_BREAK = os.getenv("REQUIRE_STRUCTURE_BREAK", "true").lower() =
 STRUCTURE_LOOKBACK = int(os.getenv("STRUCTURE_LOOKBACK", "20"))
 MAX_ZONE_AGE = int(os.getenv("MAX_ZONE_AGE", "36"))
 REQUIRE_LIVE_DEFENSE = os.getenv("REQUIRE_LIVE_DEFENSE", "true").lower() == "true"
+REQUIRE_DELTA_CVD = os.getenv("REQUIRE_DELTA_CVD", "true").lower() == "true"
+SCORE_CAP_NO_SWEEP = int(os.getenv("SCORE_CAP_NO_SWEEP", "89"))
+SCORE_CAP_NO_ABSORPTION = int(os.getenv("SCORE_CAP_NO_ABSORPTION", "84"))
+SCORE_CAP_NO_POC = int(os.getenv("SCORE_CAP_NO_POC", "82"))
 
 REST_BASES = [
     "https://fapi.binance.com",
@@ -70,7 +74,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("ahmed-of-v13.2")
+log = logging.getLogger("ahmed-of-v14")
 
 SESSION: Optional[aiohttp.ClientSession] = None
 STOP = asyncio.Event()
@@ -498,7 +502,38 @@ def score_block(local: dict, market: dict, first_test: bool, event: Optional[dic
     if REQUIRE_LIVE_DEFENSE and not live_defense:
         score = max(0, score - 20)
         no.append("دفاع حي")
+
+    # لا نسمح لبلوك متوسط بالحصول على درجة شبه كاملة لمجرد جمع عوامل شكلية.
+    # غياب عوامل الدفاع المؤسسي يضع سقفًا واقعيًا للدرجة.
+    caps: List[int] = [100]
+    if not local["sweep"]:
+        caps.append(SCORE_CAP_NO_SWEEP)
+    if not local["absorption"]:
+        caps.append(SCORE_CAP_NO_ABSORPTION)
+    if not local["poc"]:
+        caps.append(SCORE_CAP_NO_POC)
+    score = min(score, min(caps))
+
     return min(100, score), yes, no, strong, points
+
+def institutional_confidence(local: dict, market: dict) -> tuple[str, int]:
+    """Separate institutional-defense confidence from the numerical score."""
+    checks = [
+        bool(local.get("sweep")),
+        bool(local.get("absorption")),
+        bool(local.get("poc")),
+        bool(market.get("book_ok")),
+        bool(market.get("iceberg")),
+    ]
+    count = sum(checks)
+    if count >= 4:
+        return "🔥 قوية جدًا", count
+    if count >= 3:
+        return "🟢 عالية", count
+    if count >= 2:
+        return "🟡 متوسطة", count
+    return "⚪ محدودة", count
+
 
 def links(symbol: str) -> str:
     tv = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}.P"
@@ -518,6 +553,7 @@ def touch_message(symbol: str, tf: str, side: str, bottom: float, top: float, pr
     title = "🟢 <b>فرصة شراء من بلوك مؤسسي</b>" if bull else "🔴 <b>فرصة بيع من بلوك مؤسسي</b>"
     # تنبيهات لمس البلوك في هذا المشروع هي فرص ارتداد من المنطقة، وليست تنبيهات اقتراب.
     opportunity_type = "ارتداد (Reversal)"
+    inst_confidence, inst_count = institutional_confidence(local, market)
 
     # اعرض فقط العوامل التي تحققت، وبشكل مختصر مناسب للهاتف.
     preferred = ["BOS/CHoCH", "اندفاع", "حجم الانطلاق", "أول اختبار", "Delta", "CVD", "OI", "Sweep", "Absorption", "POC", "FVG", "Volume", "OrderBook", "Funding"]
@@ -534,6 +570,7 @@ def touch_message(symbol: str, tf: str, side: str, bottom: float, top: float, pr
         f"🧱 البلوك: <b>{fmt(bottom)} ➜ {fmt(top)}</b>\n"
         f"🏷️ <b>{opportunity_type}</b>\n\n"
         f"⭐ التقييم: <b>{score}/100</b> — {strength}\n"
+        f"🏦 الثقة المؤسسية: <b>{inst_confidence}</b>\n"
         f"✅ {factors}\n"
         f"⏳ عمر البلوك: <b>{local['age']} شموع</b>\n\n"
         f"🕒 {now} (السعودية)\n"
@@ -677,6 +714,15 @@ async def handle_touch(symbol: str, tf: str, c: List[Candle], event: dict) -> No
         SCORE_BUCKETS["95_100"] += 1
 
     log.info("TOUCH %s %s %s score=%s factors=%s points=%s zone=%s-%s", symbol, tf, side, score, strong, points, fmt(float(event['bottom'])), fmt(float(event['top'])))
+    if REQUIRE_DELTA_CVD and (not local["delta_ok"] or not local["cvd_ok"]):
+        REJECT_COUNT += 1
+        REJECT_REASONS["factors"] += 1
+        if not local["delta_ok"] and "Delta" in MISSING_FACTORS:
+            MISSING_FACTORS["Delta"] += 1
+        if not local["cvd_ok"] and "CVD" in MISSING_FACTORS:
+            MISSING_FACTORS["CVD"] += 1
+        log.info("REJECT reason=delta_cvd_gate symbol=%s tf=%s side=%s delta=%s cvd=%s", symbol, tf, side, local["delta_ok"], local["cvd_ok"])
+        return
     if score < MIN_SCORE:
         REJECT_COUNT += 1
         REJECT_REASONS["score"] += 1
@@ -1174,7 +1220,7 @@ async def test_messages(symbol_count: int) -> None:
 def stats_payload() -> dict:
     return {
         "ok": True,
-        "version": "v13.2",
+        "version": "v14",
         "states": len(STATES),
         "raw_ws_messages": RAW_WS_COUNT,
         "ws_errors": WS_ERROR_COUNT,
@@ -1206,6 +1252,8 @@ def stats_payload() -> dict:
         "max_zone_age": MAX_ZONE_AGE,
         "require_live_defense": REQUIRE_LIVE_DEFENSE,
         "factor_gate_enabled": FACTOR_GATE_ENABLED,
+        "require_delta_cvd": REQUIRE_DELTA_CVD,
+        "score_caps": {"no_sweep": SCORE_CAP_NO_SWEEP, "no_absorption": SCORE_CAP_NO_ABSORPTION, "no_poc": SCORE_CAP_NO_POC},
         "first_live_touch_only": FIRST_LIVE_TOUCH_ONLY,
     }
 
@@ -1214,7 +1262,7 @@ async def health(_: web.Request) -> web.Response:
 
 async def stats(_: web.Request) -> web.Response:
     data = stats_payload()
-    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v13.2</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
+    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v14</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
     return web.Response(text=html, content_type="text/html")
 
 
