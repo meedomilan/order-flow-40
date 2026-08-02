@@ -14,7 +14,7 @@ import aiohttp
 from aiohttp import web
 
 # ============================================================
-# Ahmed Order Flow Intelligence Pro v4
+# Ahmed Order Flow Intelligence Pro v5
 # Binance USDT-M Futures -> Telegram
 # 15m / 1h / 4h | Bullish OF / Bearish OF only
 # ============================================================
@@ -37,9 +37,12 @@ OF_ATR_LEN = int(os.getenv("OF_ATR_LEN", "14"))
 OF_IMPULSE = float(os.getenv("OF_IMPULSE", "0.70"))
 ZONE_SOURCE = os.getenv("ZONE_SOURCE", "Body + Wick")
 BREAK_BY_CLOSE = os.getenv("BREAK_BY_CLOSE", "true").lower() == "true"
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "220"))
+OF_USE_VOL = os.getenv("OF_USE_VOL", "false").lower() == "true"
+OF_VOL_LEN = int(os.getenv("OF_VOL_LEN", "20"))
+OF_VOL_MULT = float(os.getenv("OF_VOL_MULT", "1.10"))
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "99"))
 REST_CONCURRENCY = int(os.getenv("REST_CONCURRENCY", "2"))
-REST_GAP = float(os.getenv("REST_GAP", "0.22"))
+REST_GAP = float(os.getenv("REST_GAP", "0.45"))
 STREAMS_PER_WS = int(os.getenv("STREAMS_PER_WS", "450"))
 
 REST_BASES = [
@@ -56,7 +59,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("ahmed-of-v4")
+log = logging.getLogger("ahmed-of-v5")
 
 SESSION: Optional[aiohttp.ClientSession] = None
 STOP = asyncio.Event()
@@ -95,6 +98,7 @@ class ZoneState:
     bull_bottom: Optional[float] = None
     bull_created: Optional[int] = None
     bull_created_index: Optional[int] = None
+    bull_detected_index: Optional[int] = None
     bull_broken: bool = True
     bull_inside: bool = False
     bull_tests: int = 0
@@ -103,6 +107,7 @@ class ZoneState:
     bear_bottom: Optional[float] = None
     bear_created: Optional[int] = None
     bear_created_index: Optional[int] = None
+    bear_detected_index: Optional[int] = None
     bear_broken: bool = True
     bear_inside: bool = False
     bear_tests: int = 0
@@ -371,35 +376,50 @@ def apply_bar(c: List[Candle], i: int, s: ZoneState, emit: bool) -> List[dict]:
         p = c[candidate]
         top = p.high if ZONE_SOURCE == "Full Candle" else max(p.open, p.close)
         bottom = min(p.open, p.close) if ZONE_SOURCE == "Candle Body" else p.low
-        if (current.close - top) / max(a, 1e-12) >= OF_IMPULSE:
+        impulse = (current.close - top) / max(a, 1e-12)
+        pivot_avg_vol = sma([x.volume for x in c[:candidate+1]], OF_VOL_LEN)
+        vol_ok = (not OF_USE_VOL) or (pivot_avg_vol is not None and p.volume > pivot_avg_vol * OF_VOL_MULT)
+        if impulse >= OF_IMPULSE and vol_ok:
+            is_new = s.bull_created != p.open_time
             s.bull_top, s.bull_bottom = top, bottom
-            s.bull_created, s.bull_created_index = p.open_time, candidate
+            s.bull_created, s.bull_created_index, s.bull_detected_index = p.open_time, candidate, i
             s.bull_broken, s.bull_inside, s.bull_tests = False, False, 0
-            if emit:
+            if emit and is_new:
                 ZONE_COUNT += 1
+                if DEBUG_BLOCKS:
+                    log.info("ZONE BULL created pivot=%s detected=%s impulse=%.2f zone=%s-%s", candidate, i, impulse, fmt(bottom), fmt(top))
     if candidate >= OF_SWING and pivot_high(c, candidate, OF_SWING):
         p = c[candidate]
         top = max(p.open, p.close) if ZONE_SOURCE == "Candle Body" else p.high
         bottom = p.low if ZONE_SOURCE == "Full Candle" else min(p.open, p.close)
-        if (bottom - current.close) / max(a, 1e-12) >= OF_IMPULSE:
+        impulse = (bottom - current.close) / max(a, 1e-12)
+        pivot_avg_vol = sma([x.volume for x in c[:candidate+1]], OF_VOL_LEN)
+        vol_ok = (not OF_USE_VOL) or (pivot_avg_vol is not None and p.volume > pivot_avg_vol * OF_VOL_MULT)
+        if impulse >= OF_IMPULSE and vol_ok:
+            is_new = s.bear_created != p.open_time
             s.bear_top, s.bear_bottom = top, bottom
-            s.bear_created, s.bear_created_index = p.open_time, candidate
+            s.bear_created, s.bear_created_index, s.bear_detected_index = p.open_time, candidate, i
             s.bear_broken, s.bear_inside, s.bear_tests = False, False, 0
-            if emit:
+            if emit and is_new:
                 ZONE_COUNT += 1
+                if DEBUG_BLOCKS:
+                    log.info("ZONE BEAR created pivot=%s detected=%s impulse=%.2f zone=%s-%s", candidate, i, impulse, fmt(bottom), fmt(top))
 
     inside_bull = not s.bull_broken and s.bull_top is not None and current.high >= s.bull_bottom and current.low <= s.bull_top
     inside_bear = not s.bear_broken and s.bear_top is not None and current.high >= s.bear_bottom and current.low <= s.bear_top
     if inside_bull and not s.bull_inside:
-        s.bull_tests += 1
-        if emit:
-            TOUCH_COUNT += 1
-            out.append({"side": "bull", "bottom": s.bull_bottom, "top": s.bull_top, "tests": s.bull_tests, "created": s.bull_created, "created_index": s.bull_created_index})
+        # Pine counts any entry; Telegram waits for the first RETURN after formation.
+        if s.bull_detected_index is None or i > s.bull_detected_index:
+            s.bull_tests += 1
+            if emit:
+                TOUCH_COUNT += 1
+                out.append({"side": "bull", "bottom": s.bull_bottom, "top": s.bull_top, "tests": s.bull_tests, "created": s.bull_created, "created_index": s.bull_created_index})
     if inside_bear and not s.bear_inside:
-        s.bear_tests += 1
-        if emit:
-            TOUCH_COUNT += 1
-            out.append({"side": "bear", "bottom": s.bear_bottom, "top": s.bear_top, "tests": s.bear_tests, "created": s.bear_created, "created_index": s.bear_created_index})
+        if s.bear_detected_index is None or i > s.bear_detected_index:
+            s.bear_tests += 1
+            if emit:
+                TOUCH_COUNT += 1
+                out.append({"side": "bear", "bottom": s.bear_bottom, "top": s.bear_top, "tests": s.bear_tests, "created": s.bear_created, "created_index": s.bear_created_index})
     s.bull_inside, s.bear_inside = inside_bull, inside_bear
 
     if not s.bull_broken and s.bull_bottom is not None and (current.close if BREAK_BY_CLOSE else current.low) < s.bull_bottom:
@@ -598,7 +618,7 @@ async def test_messages(symbol_count: int) -> None:
 
 
 async def health(_: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "states": len(STATES), "events": EVENT_COUNT, "zones": ZONE_COUNT, "touches": TOUCH_COUNT, "sent": SENT_COUNT, "rejected": REJECT_COUNT, "pending": len(PENDING), "telegram": bool(BOT_TOKEN and CHAT_ID)})
+    return web.json_response({"ok": True, "states": len(STATES), "events": EVENT_COUNT, "zones": ZONE_COUNT, "touches": TOUCH_COUNT, "sent": SENT_COUNT, "rejected": REJECT_COUNT, "pending": len(PENDING), "active_bull": sum(1 for st in STATES.values() if not st.bull_broken and st.bull_top is not None), "active_bear": sum(1 for st in STATES.values() if not st.bear_broken and st.bear_top is not None), "telegram": bool(BOT_TOKEN and CHAT_ID)})
 
 
 async def start_health() -> web.AppRunner:
@@ -623,6 +643,9 @@ async def main() -> None:
         symbols = await symbols_list()
         log.info("Found %s active USDT perpetual contracts", len(symbols))
         await warmup(symbols)
+        active_bull = sum(1 for st in STATES.values() if not st.bull_broken and st.bull_top is not None)
+        active_bear = sum(1 for st in STATES.values() if not st.bear_broken and st.bear_top is not None)
+        log.info("Warm-up active zones: bull=%s bear=%s", active_bull, active_bear)
         await test_messages(len(symbols))
         streams = [f"{s.lower()}@kline_{tf}" for s in symbols for tf in TIMEFRAMES]
         chunks = [streams[i:i+STREAMS_PER_WS] for i in range(0, len(streams), STREAMS_PER_WS)]
