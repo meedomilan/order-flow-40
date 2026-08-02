@@ -1,26 +1,16 @@
-Ahmed Order Flow Intelligence Pro v13.1
+Ahmed Order Flow Intelligence Pro v14
 
-Railway variables (add to existing Telegram variables):
-MIN_SCORE=75
-FACTOR_GATE_ENABLED=false
-FIRST_LIVE_TOUCH_ONLY=true
-SEND_TEST_MESSAGES=false
-OF_IMPULSE=1.20
-OF_USE_VOL=true
-OF_VOL_MULT=1.20
-REQUIRE_STRUCTURE_BREAK=true
-STRUCTURE_LOOKBACK=20
-MAX_ZONE_AGE=36
-REQUIRE_LIVE_DEFENSE=true
-REST_CONCURRENCY=1
-REST_MIN_INTERVAL=1.10
-REST_GAP=1.25
-HISTORY_LIMIT=60
+التغييرات:
+- سقف واقعي للتقييم عند غياب Sweep أو Absorption أو POC.
+- Delta وCVD بوابة أساسية افتراضيًا قبل إرسال التنبيه.
+- إضافة الثقة المؤسسية منفصلة عن Score داخل رسالة Telegram.
+- الحفاظ على Queue + Workers وإصلاحات الاستقرار من V13.2.
 
-Changes:
-- Binance HTTP 418/429 ban expiry is detected and waited out automatically.
-- Service remains online instead of crashing during a temporary IP ban.
-- All REST calls share one safe global limiter.
-- exchangeInfo is cached in the running container.
-- Warm-up failures are non-fatal and visible in logs.
-- Price polling reduced to one all-symbol request every 12 seconds.
+متغيرات Railway الجديدة/المهمة:
+REQUIRE_DELTA_CVD=true
+SCORE_CAP_NO_SWEEP=89
+SCORE_CAP_NO_ABSORPTION=84
+SCORE_CAP_NO_POC=82
+HISTORY_WORKERS=2
+
+يمكن إبقاء بقية متغيرات V13.2 كما هي.
