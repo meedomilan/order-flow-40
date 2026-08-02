@@ -15,7 +15,7 @@ import aiohttp
 from aiohttp import web
 
 # ============================================================
-# Ahmed Order Flow Intelligence Pro v13.1
+# Ahmed Order Flow Intelligence Pro v13.2
 # Binance USDT-M Futures -> Telegram
 # 15m / 1h / 4h | Bullish OF / Bearish OF only
 # ============================================================
@@ -44,6 +44,7 @@ OF_VOL_LEN = int(os.getenv("OF_VOL_LEN", "20"))
 OF_VOL_MULT = float(os.getenv("OF_VOL_MULT", "1.20"))
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "60"))
 REST_CONCURRENCY = int(os.getenv("REST_CONCURRENCY", "1"))
+HISTORY_WORKERS = int(os.getenv("HISTORY_WORKERS", "2"))
 REST_GAP = float(os.getenv("REST_GAP", "1.25"))
 REST_MIN_INTERVAL = float(os.getenv("REST_MIN_INTERVAL", "1.10"))
 REST_BAN_EXTRA_SECONDS = float(os.getenv("REST_BAN_EXTRA_SECONDS", "3"))
@@ -69,7 +70,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("ahmed-of-v13.1")
+log = logging.getLogger("ahmed-of-v13.2")
 
 SESSION: Optional[aiohttp.ClientSession] = None
 STOP = asyncio.Event()
@@ -105,7 +106,24 @@ REST_BLOCKED_UNTIL = 0.0
 REST_REQUEST_COUNT = 0
 REST_RATE_LIMIT_COUNT = 0
 SYMBOL_CACHE_PATH = os.getenv("SYMBOL_CACHE_PATH", "/tmp/ahmed_of_symbols.json")
+BACKGROUND_TASKS: set[asyncio.Task] = set()
 
+
+
+def spawn(coro, *, name: Optional[str] = None) -> asyncio.Task:
+    """Create and track a background task so shutdown can cancel it cleanly."""
+    task = asyncio.create_task(coro, name=name)
+    BACKGROUND_TASKS.add(task)
+    task.add_done_callback(BACKGROUND_TASKS.discard)
+    return task
+
+
+async def cancel_tasks(tasks) -> None:
+    pending = [t for t in tasks if t is not None and not t.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 @dataclass
@@ -749,7 +767,7 @@ async def process_event(payload: dict) -> None:
         filtered.append(ev)
     STATES[k] = fresh
     for ev in filtered:
-        asyncio.create_task(handle_touch(symbol, tf, list(buf), ev))
+        spawn(handle_touch(symbol, tf, list(buf), ev), name=f"touch:{symbol}:{tf}")
     if c.closed:
         await check_confirmation(symbol, tf, buf)
 
@@ -794,40 +812,99 @@ async def symbols_list() -> List[str]:
     return []
 
 
-async def fetch_history(sem: asyncio.Semaphore, symbol: str, tf: str):
-    async with sem:
+async def fetch_history(symbol: str, tf: str):
+    try:
+        rows = await rest_get(
+            "/fapi/v1/klines",
+            {"symbol": symbol, "interval": tf, "limit": HISTORY_LIMIT},
+            attempts=6,
+        )
+        await asyncio.sleep(REST_GAP + random.random() * 0.03)
+        now = int(time.time() * 1000)
+        candles = [
+            Candle(
+                int(r[0]), float(r[1]), float(r[2]), float(r[3]),
+                float(r[4]), float(r[5]), float(r[7]), float(r[9]),
+                int(r[6]) < now,
+            )
+            for r in rows
+        ]
+        return symbol, tf, candles
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.error("History failed %s %s: %s", symbol, tf, exc)
+        return symbol, tf, []
+
+
+async def history_worker(
+    queue: asyncio.Queue,
+    result_queue: asyncio.Queue,
+    worker_id: int,
+) -> None:
+    while True:
+        item = await queue.get()
         try:
-            rows = await rest_get("/fapi/v1/klines", {"symbol": symbol, "interval": tf, "limit": HISTORY_LIMIT}, attempts=6)
-            await asyncio.sleep(REST_GAP + random.random()*0.03)
-            now = int(time.time()*1000)
-            candles = [Candle(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]), float(r[7]), float(r[9]), int(r[6]) < now) for r in rows]
-            return symbol, tf, candles
-        except Exception as exc:
-            log.error("History failed %s %s: %s", symbol, tf, exc)
-            return symbol, tf, []
+            if item is None:
+                return
+            symbol, tf = item
+            result = await fetch_history(symbol, tf)
+            await result_queue.put(result)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("History worker %s failed", worker_id)
+        finally:
+            queue.task_done()
 
 
 async def warmup(symbols: List[str]) -> None:
-    """Hydrate states at a deliberately safe rate.
+    """Hydrate states with a fixed worker pool; no thousands of pending tasks."""
+    jobs = [(symbol, tf) for symbol in symbols for tf in TIMEFRAMES]
+    total = len(jobs)
+    queue: asyncio.Queue = asyncio.Queue(maxsize=max(10, HISTORY_WORKERS * 4))
+    result_queue: asyncio.Queue = asyncio.Queue()
+    workers = [
+        asyncio.create_task(
+            history_worker(queue, result_queue, i + 1),
+            name=f"history-worker-{i + 1}",
+        )
+        for i in range(max(1, HISTORY_WORKERS))
+    ]
 
-    A failed symbol/timeframe is skipped and retried later by candle_refresh_loop;
-    one blocked request can no longer stop the whole Railway deployment.
-    """
-    sem = asyncio.Semaphore(max(1, REST_CONCURRENCY))
-    jobs = [fetch_history(sem, symbol, tf) for symbol in symbols for tf in TIMEFRAMES]
-    total, done, loaded = len(jobs), 0, 0
-    log.info("Warming %s symbol/timeframe states at safe REST rate...", total)
-    for fut in asyncio.as_completed(jobs):
-        if STOP.is_set():
-            break
-        symbol, tf, candles = await fut
-        done += 1
-        if candles:
-            BUFFERS[key(symbol, tf)] = candles
-            STATES[key(symbol, tf)] = rebuild(candles)
-            loaded += 1
-        if done % 50 == 0 or done == total:
-            log.info("Warm-up progress: %s/%s loaded=%s", done, total, loaded)
+    async def producer() -> None:
+        for item in jobs:
+            if STOP.is_set():
+                break
+            await queue.put(item)
+        for _ in workers:
+            await queue.put(None)
+
+    producer_task = asyncio.create_task(producer(), name="history-producer")
+    done = loaded = 0
+    log.info(
+        "Warming %s symbol/timeframe states with %s workers...",
+        total, len(workers),
+    )
+    try:
+        while done < total and not STOP.is_set():
+            try:
+                symbol, tf, candles = await asyncio.wait_for(
+                    result_queue.get(), timeout=5
+                )
+            except asyncio.TimeoutError:
+                if producer_task.done() and all(w.done() for w in workers):
+                    break
+                continue
+            done += 1
+            if candles:
+                BUFFERS[key(symbol, tf)] = candles
+                STATES[key(symbol, tf)] = rebuild(candles)
+                loaded += 1
+            if done % 50 == 0 or done == total:
+                log.info("Warm-up progress: %s/%s loaded=%s", done, total, loaded)
+    finally:
+        await cancel_tasks([producer_task, *workers])
     log.info("Warm-up finished loaded=%s failed=%s", loaded, max(0, total - loaded))
 
 
@@ -973,7 +1050,7 @@ async def process_live_price(symbol: str, price: float) -> None:
             state.bear_inside = inside
 
         for event in events:
-            asyncio.create_task(handle_touch(symbol, tf, list(candles), event))
+            spawn(handle_touch(symbol, tf, list(candles), event), name=f"touch:{symbol}:{tf}")
 
 
 async def ticker_price_poller() -> None:
@@ -1097,7 +1174,7 @@ async def test_messages(symbol_count: int) -> None:
 def stats_payload() -> dict:
     return {
         "ok": True,
-        "version": "v13.1",
+        "version": "v13.2",
         "states": len(STATES),
         "raw_ws_messages": RAW_WS_COUNT,
         "ws_errors": WS_ERROR_COUNT,
@@ -1137,7 +1214,7 @@ async def health(_: web.Request) -> web.Response:
 
 async def stats(_: web.Request) -> web.Response:
     data = stats_payload()
-    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v13.1</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
+    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v13.2</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
     return web.Response(text=html, content_type="text/html")
 
 
@@ -1161,34 +1238,61 @@ async def heartbeat() -> None:
 
 async def main() -> None:
     global SESSION, SYMBOL_SET
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_signal)
+        except (NotImplementedError, RuntimeError):
+            pass
+
     timeout = aiohttp.ClientTimeout(total=45)
-    SESSION = aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(limit=80, ttl_dns_cache=300))
+    SESSION = aiohttp.ClientSession(
+        timeout=timeout,
+        connector=aiohttp.TCPConnector(limit=80, ttl_dns_cache=300),
+    )
     runner = await start_health()
+    managed_tasks: List[asyncio.Task] = []
     try:
         if not BOT_TOKEN or not CHAT_ID:
             log.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
         symbols = await symbols_list()
+        if not symbols:
+            log.error("No symbols available; stopping cleanly")
+            return
         SYMBOL_SET = set(symbols)
         log.info("Found %s active USDT perpetual contracts", len(symbols))
         await warmup(symbols)
+        if STOP.is_set():
+            return
         active_bull = sum(1 for st in STATES.values() if not st.bull_broken and st.bull_top is not None)
         active_bear = sum(1 for st in STATES.values() if not st.bear_broken and st.bear_top is not None)
         log.info("Warm-up active zones: bull=%s bear=%s", active_bull, active_bear)
         await test_messages(len(symbols))
         streams = [f"{s.lower()}@kline_{tf}" for s in symbols for tf in TIMEFRAMES]
-        chunks = [streams[i:i+STREAMS_PER_WS] for i in range(0, len(streams), STREAMS_PER_WS)]
+        chunks = [streams[i:i + STREAMS_PER_WS] for i in range(0, len(streams), STREAMS_PER_WS)]
         log.info("Starting %s WebSocket connections", len(chunks))
-        tasks = [asyncio.create_task(ws_worker(chunk, i+1)) for i, chunk in enumerate(chunks)]
-        tasks.append(asyncio.create_task(ticker_price_poller()))
-        tasks.append(asyncio.create_task(candle_refresh_loop(symbols)))
-        tasks.append(asyncio.create_task(heartbeat()))
+        managed_tasks.extend(
+            asyncio.create_task(ws_worker(chunk, i + 1), name=f"ws-{i + 1}")
+            for i, chunk in enumerate(chunks)
+        )
+        managed_tasks.append(asyncio.create_task(ticker_price_poller(), name="ticker-poller"))
+        managed_tasks.append(asyncio.create_task(candle_refresh_loop(symbols), name="candle-refresh"))
+        managed_tasks.append(asyncio.create_task(heartbeat(), name="heartbeat"))
         await STOP.wait()
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+    except asyncio.CancelledError:
+        STOP.set()
+        raise
+    except Exception:
+        log.exception("Fatal application error")
+        STOP.set()
     finally:
+        STOP.set()
+        await cancel_tasks(managed_tasks)
+        await cancel_tasks(list(BACKGROUND_TASKS))
         await runner.cleanup()
-        await SESSION.close()
+        if SESSION is not None and not SESSION.closed:
+            await SESSION.close()
+        log.info("Shutdown complete; pending tasks cleaned")
 
 
 def stop_signal() -> None:
