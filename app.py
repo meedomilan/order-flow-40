@@ -14,7 +14,7 @@ import aiohttp
 from aiohttp import web
 
 # ============================================================
-# Ahmed Order Flow Intelligence Pro v8
+# Ahmed Order Flow Intelligence Pro v9
 # Binance USDT-M Futures -> Telegram
 # 15m / 1h / 4h | Bullish OF / Bearish OF only
 # ============================================================
@@ -72,6 +72,11 @@ RAW_WS_COUNT = 0
 WS_ERROR_COUNT = 0
 SUBSCRIPTION_ACK_COUNT = 0
 LAST_WS_MESSAGE_AT: Optional[float] = None
+PRICE_POLL_COUNT = 0
+PRICE_EVENT_COUNT = 0
+LAST_PRICE_UPDATE_AT: Optional[float] = None
+LIVE_PRICES: Dict[str, float] = {}
+SYMBOL_SET: set[str] = set()
 ZONE_COUNT = 0
 TOUCH_COUNT = 0
 SENT_COUNT = 0
@@ -669,6 +674,148 @@ async def ws_worker(streams: List[str], wid: int) -> None:
             await asyncio.sleep(5)
 
 
+async def process_live_price(symbol: str, price: float) -> None:
+    """Detect first return into active zones from a lightweight all-symbol ticker poll."""
+    global PRICE_EVENT_COUNT, TOUCH_COUNT
+    previous = LIVE_PRICES.get(symbol)
+    LIVE_PRICES[symbol] = price
+    PRICE_EVENT_COUNT += 1
+
+    for tf in TIMEFRAMES:
+        k = key(symbol, tf)
+        state = STATES.get(k)
+        candles = BUFFERS.get(k)
+        if state is None or not candles:
+            continue
+
+        # Keep the current candle usable for scoring without changing its open time.
+        cur = candles[-1]
+        cur.close = price
+        cur.high = max(cur.high, price)
+        cur.low = min(cur.low, price)
+
+        events = []
+        if not state.bull_broken and state.bull_top is not None and state.bull_bottom is not None:
+            inside = state.bull_bottom <= price <= state.bull_top
+            was_inside = state.bull_inside
+            if inside and not was_inside:
+                state.bull_tests += 1
+                TOUCH_COUNT += 1
+                events.append({
+                    "side": "bull",
+                    "bottom": state.bull_bottom,
+                    "top": state.bull_top,
+                    "tests": state.bull_tests,
+                    "created": state.bull_created,
+                    "created_index": state.bull_created_index,
+                })
+            state.bull_inside = inside
+
+        if not state.bear_broken and state.bear_top is not None and state.bear_bottom is not None:
+            inside = state.bear_bottom <= price <= state.bear_top
+            was_inside = state.bear_inside
+            if inside and not was_inside:
+                state.bear_tests += 1
+                TOUCH_COUNT += 1
+                events.append({
+                    "side": "bear",
+                    "bottom": state.bear_bottom,
+                    "top": state.bear_top,
+                    "tests": state.bear_tests,
+                    "created": state.bear_created,
+                    "created_index": state.bear_created_index,
+                })
+            state.bear_inside = inside
+
+        for event in events:
+            asyncio.create_task(handle_touch(symbol, tf, list(candles), event))
+
+
+async def ticker_price_poller() -> None:
+    """Reliable fallback: one REST request returns prices for all futures symbols."""
+    global PRICE_POLL_COUNT, LAST_PRICE_UPDATE_AT
+    while not STOP.is_set():
+        started = time.monotonic()
+        try:
+            rows = await rest_get('/fapi/v1/ticker/price', attempts=5)
+            if isinstance(rows, list):
+                PRICE_POLL_COUNT += 1
+                LAST_PRICE_UPDATE_AT = time.time()
+                for row in rows:
+                    symbol = row.get('symbol')
+                    if symbol and symbol in SYMBOL_SET:
+                        try:
+                            await process_live_price(symbol, float(row['price']))
+                        except (TypeError, ValueError, KeyError):
+                            continue
+                if PRICE_POLL_COUNT == 1 or PRICE_POLL_COUNT % 30 == 0:
+                    log.info('PRICE POLL polls=%s price_events=%s symbols=%s', PRICE_POLL_COUNT, PRICE_EVENT_COUNT, len(LIVE_PRICES))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning('Ticker price poll failed: %s', exc)
+
+        delay = max(1.0, 3.0 - (time.monotonic() - started))
+        try:
+            await asyncio.wait_for(STOP.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+
+
+def preserve_zone_runtime(old: ZoneState, fresh: ZoneState) -> ZoneState:
+    """Keep first-touch counters when the same zone survives a candle refresh."""
+    if old.bull_created is not None and old.bull_created == fresh.bull_created:
+        fresh.bull_tests = old.bull_tests
+        fresh.bull_inside = old.bull_inside
+    if old.bear_created is not None and old.bear_created == fresh.bear_created:
+        fresh.bear_tests = old.bear_tests
+        fresh.bear_inside = old.bear_inside
+    return fresh
+
+
+async def refresh_one_state(symbol: str, tf: str) -> None:
+    """Refresh the most recent candles slowly so zones continue updating without WS data."""
+    try:
+        rows = await rest_get('/fapi/v1/klines', {'symbol': symbol, 'interval': tf, 'limit': 6}, attempts=4)
+        if not isinstance(rows, list) or not rows:
+            return
+        now = int(time.time() * 1000)
+        incoming = [
+            Candle(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]), float(r[7]), float(r[9]), int(r[6]) < now)
+            for r in rows
+        ]
+        k = key(symbol, tf)
+        buf = BUFFERS.get(k)
+        if not buf:
+            return
+        by_time = {x.open_time: x for x in buf}
+        for candle in incoming:
+            by_time[candle.open_time] = candle
+        merged = sorted(by_time.values(), key=lambda x: x.open_time)[-HISTORY_LIMIT:]
+        old = STATES.get(k, ZoneState())
+        fresh = preserve_zone_runtime(old, rebuild(merged))
+        BUFFERS[k] = merged
+        STATES[k] = fresh
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.debug('State refresh failed %s %s: %s', symbol, tf, exc)
+
+
+async def candle_refresh_loop(symbols: List[str]) -> None:
+    """Stagger REST candle updates under Binance request limits."""
+    items = [(s, tf) for s in symbols for tf in TIMEFRAMES]
+    index = 0
+    while not STOP.is_set():
+        symbol, tf = items[index]
+        index = (index + 1) % len(items)
+        await refresh_one_state(symbol, tf)
+        try:
+            await asyncio.wait_for(STOP.wait(), timeout=0.65)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def test_messages(symbol_count: int) -> None:
     if not SEND_TEST_MESSAGES:
         return
@@ -697,12 +844,16 @@ async def test_messages(symbol_count: int) -> None:
 def stats_payload() -> dict:
     return {
         "ok": True,
-        "version": "v8",
+        "version": "v9",
         "states": len(STATES),
         "raw_ws_messages": RAW_WS_COUNT,
         "ws_errors": WS_ERROR_COUNT,
         "subscription_acks": SUBSCRIPTION_ACK_COUNT,
         "last_ws_message_seconds_ago": (None if LAST_WS_MESSAGE_AT is None else round(time.time() - LAST_WS_MESSAGE_AT, 1)),
+        "price_polls": PRICE_POLL_COUNT,
+        "price_events": PRICE_EVENT_COUNT,
+        "last_price_update_seconds_ago": (None if LAST_PRICE_UPDATE_AT is None else round(time.time() - LAST_PRICE_UPDATE_AT, 1)),
+        "live_prices": len(LIVE_PRICES),
         "events": EVENT_COUNT,
         "zones_created_live": ZONE_COUNT,
         "touches_detected": TOUCH_COUNT,
@@ -722,7 +873,7 @@ async def health(_: web.Request) -> web.Response:
 
 async def stats(_: web.Request) -> web.Response:
     data = stats_payload()
-    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v8</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
+    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v9</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
     return web.Response(text=html, content_type="text/html")
 
 
@@ -742,10 +893,10 @@ async def heartbeat() -> None:
     while not STOP.is_set():
         await asyncio.sleep(300)
         d = stats_payload()
-        log.info("HEARTBEAT raw=%s events=%s ws_errors=%s active_bull=%s active_bear=%s touches=%s sent=%s rejected=%s", d["raw_ws_messages"], d["events"], d["ws_errors"], d["active_bull"], d["active_bear"], d["touches_detected"], d["alerts_sent"], d["rejected_total"])
+        log.info("HEARTBEAT raw=%s events=%s price_polls=%s price_events=%s ws_errors=%s active_bull=%s active_bear=%s touches=%s sent=%s rejected=%s", d["raw_ws_messages"], d["events"], d["price_polls"], d["price_events"], d["ws_errors"], d["active_bull"], d["active_bear"], d["touches_detected"], d["alerts_sent"], d["rejected_total"])
 
 async def main() -> None:
-    global SESSION
+    global SESSION, SYMBOL_SET
     timeout = aiohttp.ClientTimeout(total=45)
     SESSION = aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(limit=80, ttl_dns_cache=300))
     runner = await start_health()
@@ -753,6 +904,7 @@ async def main() -> None:
         if not BOT_TOKEN or not CHAT_ID:
             log.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
         symbols = await symbols_list()
+        SYMBOL_SET = set(symbols)
         log.info("Found %s active USDT perpetual contracts", len(symbols))
         await warmup(symbols)
         active_bull = sum(1 for st in STATES.values() if not st.bull_broken and st.bull_top is not None)
@@ -763,6 +915,8 @@ async def main() -> None:
         chunks = [streams[i:i+STREAMS_PER_WS] for i in range(0, len(streams), STREAMS_PER_WS)]
         log.info("Starting %s WebSocket connections", len(chunks))
         tasks = [asyncio.create_task(ws_worker(chunk, i+1)) for i, chunk in enumerate(chunks)]
+        tasks.append(asyncio.create_task(ticker_price_poller()))
+        tasks.append(asyncio.create_task(candle_refresh_loop(symbols)))
         tasks.append(asyncio.create_task(heartbeat()))
         await STOP.wait()
         for t in tasks:
