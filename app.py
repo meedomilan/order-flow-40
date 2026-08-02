@@ -14,7 +14,7 @@ import aiohttp
 from aiohttp import web
 
 # ============================================================
-# Ahmed Order Flow Intelligence Pro v12
+# Ahmed Order Flow Intelligence Pro v13
 # Binance USDT-M Futures -> Telegram
 # 15m / 1h / 4h | Bullish OF / Bearish OF only
 # ============================================================
@@ -35,17 +35,22 @@ DEBUG_BLOCKS = os.getenv("DEBUG_BLOCKS", "true").lower() == "true"
 
 OF_SWING = int(os.getenv("OF_SWING", "4"))
 OF_ATR_LEN = int(os.getenv("OF_ATR_LEN", "14"))
-OF_IMPULSE = float(os.getenv("OF_IMPULSE", "0.70"))
+OF_IMPULSE = float(os.getenv("OF_IMPULSE", "1.20"))
 ZONE_SOURCE = os.getenv("ZONE_SOURCE", "Body + Wick")
 BREAK_BY_CLOSE = os.getenv("BREAK_BY_CLOSE", "true").lower() == "true"
-OF_USE_VOL = os.getenv("OF_USE_VOL", "false").lower() == "true"
+OF_USE_VOL = os.getenv("OF_USE_VOL", "true").lower() == "true"
 OF_VOL_LEN = int(os.getenv("OF_VOL_LEN", "20"))
-OF_VOL_MULT = float(os.getenv("OF_VOL_MULT", "1.10"))
+OF_VOL_MULT = float(os.getenv("OF_VOL_MULT", "1.20"))
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "99"))
 REST_CONCURRENCY = int(os.getenv("REST_CONCURRENCY", "2"))
 REST_GAP = float(os.getenv("REST_GAP", "0.45"))
 STREAMS_PER_WS = int(os.getenv("STREAMS_PER_WS", "180"))
 FIRST_LIVE_TOUCH_ONLY = os.getenv("FIRST_LIVE_TOUCH_ONLY", "true").lower() == "true"
+
+REQUIRE_STRUCTURE_BREAK = os.getenv("REQUIRE_STRUCTURE_BREAK", "true").lower() == "true"
+STRUCTURE_LOOKBACK = int(os.getenv("STRUCTURE_LOOKBACK", "20"))
+MAX_ZONE_AGE = int(os.getenv("MAX_ZONE_AGE", "36"))
+REQUIRE_LIVE_DEFENSE = os.getenv("REQUIRE_LIVE_DEFENSE", "true").lower() == "true"
 
 REST_BASES = [
     "https://fapi.binance.com",
@@ -61,7 +66,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("ahmed-of-v12")
+log = logging.getLogger("ahmed-of-v13")
 
 SESSION: Optional[aiohttp.ClientSession] = None
 STOP = asyncio.Event()
@@ -121,6 +126,9 @@ class ZoneState:
     bull_inside: bool = False
     bull_tests: int = 0
     bull_live_tests: int = 0
+    bull_impulse: float = 0.0
+    bull_structure: str = ""
+    bull_launch_volume: bool = False
 
     bear_top: Optional[float] = None
     bear_bottom: Optional[float] = None
@@ -131,6 +139,9 @@ class ZoneState:
     bear_inside: bool = False
     bear_tests: int = 0
     bear_live_tests: int = 0
+    bear_impulse: float = 0.0
+    bear_structure: str = ""
+    bear_launch_volume: bool = False
 
 
 @dataclass
@@ -193,6 +204,25 @@ def pivot_high(c: List[Candle], i: int, n: int) -> bool:
     return v >= max(x.high for x in c[i-n:i]) and v >= max(x.high for x in c[i+1:i+n+1])
 
 
+def structure_break(c: List[Candle], candidate: int, current_index: int, side: str) -> bool:
+    """Require displacement to break a meaningful pre-pivot structure level."""
+    start = max(0, candidate - STRUCTURE_LOOKBACK)
+    prior = c[start:candidate]
+    if len(prior) < max(5, OF_SWING):
+        return False
+    current = c[current_index]
+    if side == "bull":
+        return current.close > max(x.high for x in prior)
+    return current.close < min(x.low for x in prior)
+
+
+def launch_volume_ok(c: List[Candle], current_index: int) -> bool:
+    start = max(0, current_index - OF_VOL_LEN)
+    prior = [x.volume for x in c[start:current_index]]
+    avg = sma(prior, min(OF_VOL_LEN, len(prior))) if prior else None
+    return bool(avg and c[current_index].volume >= avg * OF_VOL_MULT)
+
+
 def fvg_present(c: List[Candle], idx: int, side: str) -> bool:
     start = max(2, idx - 2)
     end = min(len(c), idx + 5)
@@ -229,7 +259,7 @@ def local_metrics(c: List[Candle], side: str, zone_bottom: float, zone_top: floa
         sweep = bool(before) and cur.high > max(x.high for x in before) and cur.close < zone_top
 
     age = max(0, len(c) - 1 - created_index)
-    freshness = age <= 12
+    freshness = age <= MAX_ZONE_AGE
     fvg = fvg_present(c, created_index, side)
 
     # Candle-volume POC proxy: highest-volume candle whose typical price is inside the block.
@@ -337,21 +367,24 @@ async def market_confirmation(symbol: str, tf: str, side: str) -> dict:
     return result
 
 
-def score_block(local: dict, market: dict, first_test: bool) -> tuple[int, List[str], List[str], int, dict]:
-    """Weighted quality score. It is not a guaranteed success probability."""
+def score_block(local: dict, market: dict, first_test: bool, event: Optional[dict] = None) -> tuple[int, List[str], List[str], int, dict]:
+    """Institutional-style weighted quality score; not a success probability."""
+    event = event or {}
     weights = [
-        (True, 20, "OF + ATR", False),
+        (bool(event.get("structure_ok")), 16, "BOS/CHoCH", True),
+        (float(event.get("impulse", 0.0)) >= OF_IMPULSE, 12, "اندفاع", True),
+        (bool(event.get("launch_volume")), 10, "حجم الانطلاق", True),
         (first_test, 10, "أول اختبار", False),
-        (local["delta_ok"], 15, "Delta", True),
-        (local["cvd_ok"], 12, "CVD", True),
-        (market["oi_up"], 10, "OI", True),
-        (local["sweep"], 12, "Sweep", True),
+        (local["delta_ok"], 12, "Delta", True),
+        (local["cvd_ok"], 10, "CVD", True),
+        (market["oi_up"], 8, "OI", True),
+        (local["sweep"], 8, "Sweep", True),
         (local["absorption"], 8, "Absorption", True),
-        (local["poc"], 7, "POC", True),
-        (local["fvg"], 6, "FVG", True),
+        (local["poc"], 5, "POC", False),
+        (local["fvg"], 5, "FVG", False),
         (local["volume_spike"], 5, "Volume", True),
-        (market["book_ok"], 3, "OrderBook", True),
-        (market["funding_ok"], 2, "Funding", True),
+        (market["book_ok"], 4, "OrderBook", False),
+        (market["funding_ok"], 2, "Funding", False),
         (local["freshness"], 5, "حديث", False),
     ]
     score = 0
@@ -369,6 +402,11 @@ def score_block(local: dict, market: dict, first_test: bool) -> tuple[int, List[
         else:
             no.append(name)
             points[name] = 0
+    # A touch without visible defense is downgraded heavily.
+    live_defense = local["delta_ok"] or local["absorption"] or local["sweep"]
+    if REQUIRE_LIVE_DEFENSE and not live_defense:
+        score = max(0, score - 20)
+        no.append("دفاع حي")
     return min(100, score), yes, no, strong, points
 
 def links(symbol: str) -> str:
@@ -386,12 +424,12 @@ def touch_message(symbol: str, tf: str, side: str, bottom: float, top: float, pr
     else:
         strength = "🟡 جيدة"
 
-    title = "🟢 <b>فرصة شراء من Order Flow</b>" if bull else "🔴 <b>فرصة بيع من Order Flow</b>"
+    title = "🟢 <b>فرصة شراء من بلوك مؤسسي</b>" if bull else "🔴 <b>فرصة بيع من بلوك مؤسسي</b>"
     # تنبيهات لمس البلوك في هذا المشروع هي فرص ارتداد من المنطقة، وليست تنبيهات اقتراب.
     opportunity_type = "ارتداد (Reversal)"
 
     # اعرض فقط العوامل التي تحققت، وبشكل مختصر مناسب للهاتف.
-    preferred = ["أول اختبار", "Delta", "CVD", "OI", "Sweep", "Absorption", "POC", "FVG", "Volume", "OrderBook", "Funding"]
+    preferred = ["BOS/CHoCH", "اندفاع", "حجم الانطلاق", "أول اختبار", "Delta", "CVD", "OI", "Sweep", "Absorption", "POC", "FVG", "Volume", "OrderBook", "Funding"]
     factor_names = [name for name in preferred if name in yes]
     factor_names = ["First Touch" if name == "أول اختبار" else name for name in factor_names]
     rows = [" • ".join(factor_names[i:i+4]) for i in range(0, min(len(factor_names), 8), 4)]
@@ -446,12 +484,16 @@ def apply_bar(c: List[Candle], i: int, s: ZoneState, emit: bool) -> List[dict]:
         bottom = min(p.open, p.close) if ZONE_SOURCE == "Candle Body" else p.low
         impulse = (current.close - top) / max(a, 1e-12)
         pivot_avg_vol = sma([x.volume for x in c[:candidate+1]], OF_VOL_LEN)
-        vol_ok = (not OF_USE_VOL) or (pivot_avg_vol is not None and p.volume > pivot_avg_vol * OF_VOL_MULT)
-        if impulse >= OF_IMPULSE and vol_ok:
+        pivot_vol_ok = (not OF_USE_VOL) or (pivot_avg_vol is not None and p.volume > pivot_avg_vol * 0.80)
+        launch_vol = launch_volume_ok(c, i)
+        structure_ok = structure_break(c, candidate, i, "bull")
+        vol_ok = pivot_vol_ok and ((not OF_USE_VOL) or launch_vol)
+        if impulse >= OF_IMPULSE and vol_ok and ((not REQUIRE_STRUCTURE_BREAK) or structure_ok):
             is_new = s.bull_created != p.open_time
             s.bull_top, s.bull_bottom = top, bottom
             s.bull_created, s.bull_created_index, s.bull_detected_index = p.open_time, candidate, i
             s.bull_broken, s.bull_inside, s.bull_tests = False, False, 0
+            s.bull_impulse, s.bull_structure, s.bull_launch_volume = impulse, "BOS/CHoCH", launch_vol
             if emit and is_new:
                 ZONE_COUNT += 1
                 if DEBUG_BLOCKS:
@@ -462,12 +504,16 @@ def apply_bar(c: List[Candle], i: int, s: ZoneState, emit: bool) -> List[dict]:
         bottom = p.low if ZONE_SOURCE == "Full Candle" else min(p.open, p.close)
         impulse = (bottom - current.close) / max(a, 1e-12)
         pivot_avg_vol = sma([x.volume for x in c[:candidate+1]], OF_VOL_LEN)
-        vol_ok = (not OF_USE_VOL) or (pivot_avg_vol is not None and p.volume > pivot_avg_vol * OF_VOL_MULT)
-        if impulse >= OF_IMPULSE and vol_ok:
+        pivot_vol_ok = (not OF_USE_VOL) or (pivot_avg_vol is not None and p.volume > pivot_avg_vol * 0.80)
+        launch_vol = launch_volume_ok(c, i)
+        structure_ok = structure_break(c, candidate, i, "bear")
+        vol_ok = pivot_vol_ok and ((not OF_USE_VOL) or launch_vol)
+        if impulse >= OF_IMPULSE and vol_ok and ((not REQUIRE_STRUCTURE_BREAK) or structure_ok):
             is_new = s.bear_created != p.open_time
             s.bear_top, s.bear_bottom = top, bottom
             s.bear_created, s.bear_created_index, s.bear_detected_index = p.open_time, candidate, i
             s.bear_broken, s.bear_inside, s.bear_tests = False, False, 0
+            s.bear_impulse, s.bear_structure, s.bear_launch_volume = impulse, "BOS/CHoCH", launch_vol
             if emit and is_new:
                 ZONE_COUNT += 1
                 if DEBUG_BLOCKS:
@@ -482,14 +528,14 @@ def apply_bar(c: List[Candle], i: int, s: ZoneState, emit: bool) -> List[dict]:
             if emit:
                 s.bull_live_tests += 1
                 TOUCH_COUNT += 1
-                out.append({"side": "bull", "bottom": s.bull_bottom, "top": s.bull_top, "tests": s.bull_live_tests if FIRST_LIVE_TOUCH_ONLY else s.bull_tests, "historical_tests": s.bull_tests, "created": s.bull_created, "created_index": s.bull_created_index})
+                out.append({"side": "bull", "bottom": s.bull_bottom, "top": s.bull_top, "tests": s.bull_live_tests if FIRST_LIVE_TOUCH_ONLY else s.bull_tests, "historical_tests": s.bull_tests, "created": s.bull_created, "created_index": s.bull_created_index, "impulse": s.bull_impulse, "structure_ok": bool(s.bull_structure), "launch_volume": s.bull_launch_volume})
     if inside_bear and not s.bear_inside:
         if s.bear_detected_index is None or i > s.bear_detected_index:
             s.bear_tests += 1
             if emit:
                 s.bear_live_tests += 1
                 TOUCH_COUNT += 1
-                out.append({"side": "bear", "bottom": s.bear_bottom, "top": s.bear_top, "tests": s.bear_live_tests if FIRST_LIVE_TOUCH_ONLY else s.bear_tests, "historical_tests": s.bear_tests, "created": s.bear_created, "created_index": s.bear_created_index})
+                out.append({"side": "bear", "bottom": s.bear_bottom, "top": s.bear_top, "tests": s.bear_live_tests if FIRST_LIVE_TOUCH_ONLY else s.bear_tests, "historical_tests": s.bear_tests, "created": s.bear_created, "created_index": s.bear_created_index, "impulse": s.bear_impulse, "structure_ok": bool(s.bear_structure), "launch_volume": s.bear_launch_volume})
     s.bull_inside, s.bear_inside = inside_bull, inside_bear
 
     if not s.bull_broken and s.bull_bottom is not None and (current.close if BREAK_BY_CLOSE else current.low) < s.bull_bottom:
@@ -527,7 +573,7 @@ async def handle_touch(symbol: str, tf: str, c: List[Candle], event: dict) -> No
         return
     local = local_metrics(c, side, float(event["bottom"]), float(event["top"]), int(event["created_index"] or 0))
     market = await market_confirmation(symbol, tf, side)
-    score, yes, no, strong, points = score_block(local, market, True)
+    score, yes, no, strong, points = score_block(local, market, True, event)
     if score < 60:
         SCORE_BUCKETS["under_60"] += 1
     elif score < 75:
@@ -786,6 +832,7 @@ async def process_live_price(symbol: str, price: float) -> None:
                     "historical_tests": state.bull_tests,
                     "created": state.bull_created,
                     "created_index": state.bull_created_index,
+                    "impulse": state.bull_impulse, "structure_ok": bool(state.bull_structure), "launch_volume": state.bull_launch_volume,
                 })
             state.bull_inside = inside
 
@@ -804,6 +851,7 @@ async def process_live_price(symbol: str, price: float) -> None:
                     "historical_tests": state.bear_tests,
                     "created": state.bear_created,
                     "created_index": state.bear_created_index,
+                    "impulse": state.bear_impulse, "structure_ok": bool(state.bear_structure), "launch_volume": state.bear_launch_volume,
                 })
             state.bear_inside = inside
 
@@ -848,10 +896,16 @@ def preserve_zone_runtime(old: ZoneState, fresh: ZoneState) -> ZoneState:
         fresh.bull_tests = old.bull_tests
         fresh.bull_live_tests = old.bull_live_tests
         fresh.bull_inside = old.bull_inside
+        fresh.bull_impulse = old.bull_impulse
+        fresh.bull_structure = old.bull_structure
+        fresh.bull_launch_volume = old.bull_launch_volume
     if old.bear_created is not None and old.bear_created == fresh.bear_created:
         fresh.bear_tests = old.bear_tests
         fresh.bear_live_tests = old.bear_live_tests
         fresh.bear_inside = old.bear_inside
+        fresh.bear_impulse = old.bear_impulse
+        fresh.bear_structure = old.bear_structure
+        fresh.bear_launch_volume = old.bear_launch_volume
     return fresh
 
 
@@ -926,7 +980,7 @@ async def test_messages(symbol_count: int) -> None:
 def stats_payload() -> dict:
     return {
         "ok": True,
-        "version": "v12",
+        "version": "v13",
         "states": len(STATES),
         "raw_ws_messages": RAW_WS_COUNT,
         "ws_errors": WS_ERROR_COUNT,
@@ -950,6 +1004,10 @@ def stats_payload() -> dict:
         "telegram_configured": bool(BOT_TOKEN and CHAT_ID),
         "minimum_score": MIN_SCORE,
         "minimum_strong_factors": MIN_STRONG_FACTORS,
+        "of_impulse": OF_IMPULSE,
+        "require_structure_break": REQUIRE_STRUCTURE_BREAK,
+        "max_zone_age": MAX_ZONE_AGE,
+        "require_live_defense": REQUIRE_LIVE_DEFENSE,
         "factor_gate_enabled": FACTOR_GATE_ENABLED,
         "first_live_touch_only": FIRST_LIVE_TOUCH_ONLY,
     }
@@ -959,7 +1017,7 @@ async def health(_: web.Request) -> web.Response:
 
 async def stats(_: web.Request) -> web.Response:
     data = stats_payload()
-    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v12</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
+    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v13</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
     return web.Response(text=html, content_type="text/html")
 
 
