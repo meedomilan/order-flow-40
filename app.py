@@ -14,7 +14,7 @@ import aiohttp
 from aiohttp import web
 
 # ============================================================
-# Ahmed Order Flow Intelligence Pro v11
+# Ahmed Order Flow Intelligence Pro v12
 # Binance USDT-M Futures -> Telegram
 # 15m / 1h / 4h | Bullish OF / Bearish OF only
 # ============================================================
@@ -29,6 +29,7 @@ PORT = int(os.getenv("PORT", "8080"))
 MIN_SCORE = int(os.getenv("MIN_SCORE", "75"))
 SEND_TEST_MESSAGES = os.getenv("SEND_TEST_MESSAGES", "true").lower() == "true"
 MIN_STRONG_FACTORS = int(os.getenv("MIN_STRONG_FACTORS", "4"))
+FACTOR_GATE_ENABLED = os.getenv("FACTOR_GATE_ENABLED", "false").lower() == "true"
 COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "12"))
 DEBUG_BLOCKS = os.getenv("DEBUG_BLOCKS", "true").lower() == "true"
 
@@ -60,7 +61,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("ahmed-of-v8")
+log = logging.getLogger("ahmed-of-v12")
 
 SESSION: Optional[aiohttp.ClientSession] = None
 STOP = asyncio.Event()
@@ -83,6 +84,11 @@ TOUCH_COUNT = 0
 SENT_COUNT = 0
 REJECT_COUNT = 0
 REJECT_REASONS: Dict[str, int] = {"score": 0, "factors": 0, "cooldown": 0, "duplicate": 0, "second_touch": 0}
+MISSING_FACTORS: Dict[str, int] = {
+    "Delta": 0, "CVD": 0, "OI": 0, "Sweep": 0, "Absorption": 0,
+    "POC": 0, "FVG": 0, "Volume": 0, "OrderBook": 0, "Funding": 0,
+}
+SCORE_BUCKETS: Dict[str, int] = {"under_60": 0, "60_74": 0, "75_84": 0, "85_94": 0, "95_100": 0}
 LAST_TOUCH_AT: Dict[str, float] = {}
 LAST_ALERT_AT: Dict[str, float] = {}
 
@@ -225,6 +231,15 @@ def local_metrics(c: List[Candle], side: str, zone_bottom: float, zone_top: floa
     age = max(0, len(c) - 1 - created_index)
     freshness = age <= 12
     fvg = fvg_present(c, created_index, side)
+
+    # Candle-volume POC proxy: highest-volume candle whose typical price is inside the block.
+    zone_candles = c[max(0, created_index - 1):]
+    poc = False
+    if zone_candles:
+        hv = max(zone_candles, key=lambda x: x.volume)
+        typical = (hv.high + hv.low + hv.close) / 3.0
+        poc = zone_bottom <= typical <= zone_top
+
     return {
         "volume_spike": volume_spike,
         "delta_ok": delta_ok,
@@ -233,6 +248,7 @@ def local_metrics(c: List[Candle], side: str, zone_bottom: float, zone_top: floa
         "sweep": sweep,
         "freshness": freshness,
         "fvg": fvg,
+        "poc": poc,
         "age": age,
         "recent_cvd": recent_cvd,
     }
@@ -285,55 +301,75 @@ async def telegram(text: str) -> bool:
 
 
 async def market_confirmation(symbol: str, tf: str, side: str) -> dict:
-    """تُطلب فقط عند أول لمس، لتجنب ضغط Binance."""
-    result = {"oi_up": False, "book_ok": False, "iceberg": False}
+    """Fetch limited live confirmation data only at the first touch."""
+    result = {
+        "oi_up": False,
+        "book_ok": False,
+        "iceberg": False,
+        "funding_ok": False,
+        "funding_rate": 0.0,
+    }
     try:
         oi_period = "5m" if tf == "15m" else ("15m" if tf == "1h" else "1h")
-        oi_data, depth = await asyncio.gather(
+        oi_data, depth, premium = await asyncio.gather(
             rest_get("/futures/data/openInterestHist", {"symbol": symbol, "period": oi_period, "limit": 3}, attempts=4),
             rest_get("/fapi/v1/depth", {"symbol": symbol, "limit": 20}, attempts=4),
+            rest_get("/fapi/v1/premiumIndex", {"symbol": symbol}, attempts=4),
         )
         if isinstance(oi_data, list) and len(oi_data) >= 2:
             a = float(oi_data[-2].get("sumOpenInterest", 0))
             b = float(oi_data[-1].get("sumOpenInterest", 0))
             result["oi_up"] = b > a
+
         bids = sum(float(p) * float(q) for p, q in depth.get("bids", []))
         asks = sum(float(p) * float(q) for p, q in depth.get("asks", []))
         total = max(bids + asks, 1e-12)
         imbalance = (bids - asks) / total
         result["book_ok"] = imbalance >= 0.12 if side == "bull" else imbalance <= -0.12
         result["iceberg"] = abs(imbalance) >= 0.25
+
+        funding = float(premium.get("lastFundingRate", 0.0)) if isinstance(premium, dict) else 0.0
+        result["funding_rate"] = funding
+        # Avoid heavily crowded positioning against the intended reversal.
+        result["funding_ok"] = funding <= 0.0005 if side == "bull" else funding >= -0.0005
     except Exception as exc:
         log.warning("Market confirmation failed %s %s: %s", symbol, tf, exc)
     return result
 
 
-def score_block(local: dict, market: dict, first_test: bool) -> tuple[int, List[str], List[str], int]:
-    # الدرجة ليست احتمال نجاح؛ هي جودة توافق العوامل الحالية.
-    score = 35  # تكوّن OF مطابق للمؤشر + اندفاع ATR
-    yes, no = ["OF + ATR"], []
-    factors = [
-        (first_test, 12, "أول اختبار"),
-        (local["freshness"], 6, "حديث"),
-        (local["sweep"], 12, "Sweep"),
-        (local["absorption"], 10, "Absorption"),
-        (local["delta_ok"], 9, "Delta"),
-        (local["cvd_ok"], 8, "CVD"),
-        (local["volume_spike"], 7, "Volume"),
-        (local["fvg"], 5, "FVG"),
-        (market["oi_up"], 4, "OI"),
-        (market["book_ok"], 4, "OrderBook"),
+def score_block(local: dict, market: dict, first_test: bool) -> tuple[int, List[str], List[str], int, dict]:
+    """Weighted quality score. It is not a guaranteed success probability."""
+    weights = [
+        (True, 20, "OF + ATR", False),
+        (first_test, 10, "أول اختبار", False),
+        (local["delta_ok"], 15, "Delta", True),
+        (local["cvd_ok"], 12, "CVD", True),
+        (market["oi_up"], 10, "OI", True),
+        (local["sweep"], 12, "Sweep", True),
+        (local["absorption"], 8, "Absorption", True),
+        (local["poc"], 7, "POC", True),
+        (local["fvg"], 6, "FVG", True),
+        (local["volume_spike"], 5, "Volume", True),
+        (market["book_ok"], 3, "OrderBook", True),
+        (market["funding_ok"], 2, "Funding", True),
+        (local["freshness"], 5, "حديث", False),
     ]
+    score = 0
+    yes: List[str] = []
+    no: List[str] = []
+    points: dict[str, int] = {}
     strong = 0
-    for ok, points, name in factors:
+    for ok, weight, name, is_strong in weights:
         if ok:
-            score += points
+            score += weight
             yes.append(name)
-            if name not in ("أول اختبار", "حديث"):
+            points[name] = weight
+            if is_strong:
                 strong += 1
         else:
             no.append(name)
-    return min(100, score), yes, no, strong
+            points[name] = 0
+    return min(100, score), yes, no, strong, points
 
 def links(symbol: str) -> str:
     tv = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}.P"
@@ -355,9 +391,11 @@ def touch_message(symbol: str, tf: str, side: str, bottom: float, top: float, pr
     opportunity_type = "ارتداد (Reversal)"
 
     # اعرض فقط العوامل التي تحققت، وبشكل مختصر مناسب للهاتف.
-    factor_names = [name for name in yes if name not in ("OF + ATR", "حديث")]
+    preferred = ["أول اختبار", "Delta", "CVD", "OI", "Sweep", "Absorption", "POC", "FVG", "Volume", "OrderBook", "Funding"]
+    factor_names = [name for name in preferred if name in yes]
     factor_names = ["First Touch" if name == "أول اختبار" else name for name in factor_names]
-    factors = " • ".join(factor_names[:8]) or "OF • ATR"
+    rows = [" • ".join(factor_names[i:i+4]) for i in range(0, min(len(factor_names), 8), 4)]
+    factors = "\n✅ ".join(rows) if rows else "OF • ATR"
 
     now = datetime.now(RIYADH).strftime("%d-%m-%Y %H:%M")
     return (
@@ -489,17 +527,34 @@ async def handle_touch(symbol: str, tf: str, c: List[Candle], event: dict) -> No
         return
     local = local_metrics(c, side, float(event["bottom"]), float(event["top"]), int(event["created_index"] or 0))
     market = await market_confirmation(symbol, tf, side)
-    score, yes, no, strong = score_block(local, market, True)
-    log.info("TOUCH %s %s %s score=%s factors=%s zone=%s-%s", symbol, tf, side, score, strong, fmt(float(event['bottom'])), fmt(float(event['top'])))
+    score, yes, no, strong, points = score_block(local, market, True)
+    if score < 60:
+        SCORE_BUCKETS["under_60"] += 1
+    elif score < 75:
+        SCORE_BUCKETS["60_74"] += 1
+    elif score < 85:
+        SCORE_BUCKETS["75_84"] += 1
+    elif score < 95:
+        SCORE_BUCKETS["85_94"] += 1
+    else:
+        SCORE_BUCKETS["95_100"] += 1
+
+    log.info("TOUCH %s %s %s score=%s factors=%s points=%s zone=%s-%s", symbol, tf, side, score, strong, points, fmt(float(event['bottom'])), fmt(float(event['top'])))
     if score < MIN_SCORE:
         REJECT_COUNT += 1
         REJECT_REASONS["score"] += 1
-        log.info("REJECT reason=score symbol=%s tf=%s side=%s score=%s required=%s missing=%s", symbol, tf, side, score, MIN_SCORE, ','.join(no[:6]))
+        for name in no:
+            if name in MISSING_FACTORS:
+                MISSING_FACTORS[name] += 1
+        log.info("REJECT reason=score symbol=%s tf=%s side=%s score=%s required=%s missing=%s", symbol, tf, side, score, MIN_SCORE, ','.join(no[:8]))
         return
-    if strong < MIN_STRONG_FACTORS:
+    if FACTOR_GATE_ENABLED and strong < MIN_STRONG_FACTORS:
         REJECT_COUNT += 1
         REJECT_REASONS["factors"] += 1
-        log.info("REJECT reason=factors symbol=%s tf=%s side=%s factors=%s required=%s missing=%s", symbol, tf, side, strong, MIN_STRONG_FACTORS, ','.join(no[:6]))
+        for name in no:
+            if name in MISSING_FACTORS:
+                MISSING_FACTORS[name] += 1
+        log.info("REJECT reason=factors symbol=%s tf=%s side=%s factors=%s required=%s missing=%s", symbol, tf, side, strong, MIN_STRONG_FACTORS, ','.join(no[:8]))
         return
     DEDUP.add(dedup)
     LAST_ALERT_AT[cooldown_key] = time.time()
@@ -850,7 +905,7 @@ async def test_messages(symbol_count: int) -> None:
         "✅ <b>Ahmed Order Flow Intelligence بدأ العمل</b>\n\n"
         f"💹 العقود: <b>{symbol_count} Binance USDT Futures</b>\n"
         "⏰ الفريمات: <b>15m — 1H — 4H</b>\n"
-        f"🎯 الجودة: <b>{MIN_SCORE}%+</b> | العوامل: <b>{MIN_STRONG_FACTORS}+</b>\n"
+        f"🎯 الجودة: <b>{MIN_SCORE}/100+</b> | بوابة العوامل: <b>{'مفعلة' if FACTOR_GATE_ENABLED else 'غير مفعلة'}</b>\n"
         "🧪 أول اختبار فقط\n"
         "🔁 منع التكرار مفعل\n"
         f"⏳ منع التكرار: <b>{COOLDOWN_HOURS} ساعة</b>\n📩 رسالة مختصرة + تأكيد فقط"
@@ -871,7 +926,7 @@ async def test_messages(symbol_count: int) -> None:
 def stats_payload() -> dict:
     return {
         "ok": True,
-        "version": "v11",
+        "version": "v12",
         "states": len(STATES),
         "raw_ws_messages": RAW_WS_COUNT,
         "ws_errors": WS_ERROR_COUNT,
@@ -887,12 +942,15 @@ def stats_payload() -> dict:
         "alerts_sent": SENT_COUNT,
         "rejected_total": REJECT_COUNT,
         "rejected_reasons": dict(REJECT_REASONS),
+        "missing_factors_on_reject": dict(MISSING_FACTORS),
+        "score_buckets": dict(SCORE_BUCKETS),
         "pending_confirmations": len(PENDING),
         "active_bull": sum(1 for st in STATES.values() if not st.bull_broken and st.bull_top is not None),
         "active_bear": sum(1 for st in STATES.values() if not st.bear_broken and st.bear_top is not None),
         "telegram_configured": bool(BOT_TOKEN and CHAT_ID),
         "minimum_score": MIN_SCORE,
         "minimum_strong_factors": MIN_STRONG_FACTORS,
+        "factor_gate_enabled": FACTOR_GATE_ENABLED,
         "first_live_touch_only": FIRST_LIVE_TOUCH_ONLY,
     }
 
@@ -901,7 +959,7 @@ async def health(_: web.Request) -> web.Response:
 
 async def stats(_: web.Request) -> web.Response:
     data = stats_payload()
-    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v11</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
+    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v12</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
     return web.Response(text=html, content_type="text/html")
 
 
