@@ -14,7 +14,7 @@ import aiohttp
 from aiohttp import web
 
 # ============================================================
-# Ahmed Order Flow Intelligence Pro v6
+# Ahmed Order Flow Intelligence Pro v7
 # Binance USDT-M Futures -> Telegram
 # 15m / 1h / 4h | Bullish OF / Bearish OF only
 # ============================================================
@@ -43,7 +43,7 @@ OF_VOL_MULT = float(os.getenv("OF_VOL_MULT", "1.10"))
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "99"))
 REST_CONCURRENCY = int(os.getenv("REST_CONCURRENCY", "2"))
 REST_GAP = float(os.getenv("REST_GAP", "0.45"))
-STREAMS_PER_WS = int(os.getenv("STREAMS_PER_WS", "450"))
+STREAMS_PER_WS = int(os.getenv("STREAMS_PER_WS", "180"))
 
 REST_BASES = [
     "https://fapi.binance.com",
@@ -52,14 +52,14 @@ REST_BASES = [
     "https://fapi3.binance.com",
     "https://fapi4.binance.com",
 ]
-WS_URL = os.getenv("BINANCE_WS", "wss://fstream.binance.com/ws")
+WS_BASE = os.getenv("BINANCE_WS_BASE", "wss://fstream.binance.com/stream?streams=")
 TG_API = "https://api.telegram.org"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("ahmed-of-v6")
+log = logging.getLogger("ahmed-of-v7")
 
 SESSION: Optional[aiohttp.ClientSession] = None
 STOP = asyncio.Event()
@@ -68,6 +68,8 @@ STATES: Dict[str, "ZoneState"] = {}
 PENDING: Dict[str, "PendingConfirmation"] = {}
 DEDUP: set[str] = set()
 EVENT_COUNT = 0
+RAW_WS_COUNT = 0
+WS_ERROR_COUNT = 0
 ZONE_COUNT = 0
 TOUCH_COUNT = 0
 SENT_COUNT = 0
@@ -584,31 +586,46 @@ async def warmup(symbols: List[str]) -> None:
 
 
 async def ws_worker(streams: List[str], wid: int) -> None:
+    global RAW_WS_COUNT, WS_ERROR_COUNT
     assert SESSION is not None
-    rid = wid * 10000
+    # Combined Stream: الاشتراك موجود داخل الرابط نفسه، لذلك لا نعتمد على
+    # رسائل SUBSCRIBE التي كانت تتصل دون أن تستقبل أحداثًا على Railway.
+    url = WS_BASE + "/".join(streams)
     while not STOP.is_set():
         try:
-            async with SESSION.ws_connect(WS_URL, heartbeat=120, receive_timeout=240, max_msg_size=3_000_000) as ws:
-                log.info("WS %s connected (%s streams)", wid, len(streams))
-                for i in range(0, len(streams), 200):
-                    rid += 1
-                    await ws.send_json({"method": "SUBSCRIBE", "params": streams[i:i+200], "id": rid})
-                    await asyncio.sleep(0.3)
+            async with SESSION.ws_connect(
+                url,
+                heartbeat=60,
+                receive_timeout=180,
+                max_msg_size=5_000_000,
+                autoclose=True,
+                autoping=True,
+            ) as ws:
+                log.info("WS %s combined connected (%s streams)", wid, len(streams))
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
+                        RAW_WS_COUNT += 1
                         try:
                             data = json.loads(msg.data)
-                            if "result" not in data:
-                                await process_event(data)
+                            await process_event(data)
+                            if RAW_WS_COUNT == 1 or RAW_WS_COUNT % 5000 == 0:
+                                log.info("WS raw messages=%s kline_events=%s", RAW_WS_COUNT, EVENT_COUNT)
                         except Exception:
-                            log.exception("WS event error")
-                    elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                            WS_ERROR_COUNT += 1
+                            log.exception("WS event error wid=%s", wid)
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        WS_ERROR_COUNT += 1
+                        log.warning("WS %s message error: %s", wid, ws.exception())
+                        break
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
                         break
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            WS_ERROR_COUNT += 1
             log.warning("WS %s disconnected: %s", wid, exc)
-        await asyncio.sleep(5)
+        if not STOP.is_set():
+            await asyncio.sleep(5)
 
 
 async def test_messages(symbol_count: int) -> None:
@@ -639,8 +656,10 @@ async def test_messages(symbol_count: int) -> None:
 def stats_payload() -> dict:
     return {
         "ok": True,
-        "version": "v6",
+        "version": "v7",
         "states": len(STATES),
+        "raw_ws_messages": RAW_WS_COUNT,
+        "ws_errors": WS_ERROR_COUNT,
         "events": EVENT_COUNT,
         "zones_created_live": ZONE_COUNT,
         "touches_detected": TOUCH_COUNT,
@@ -660,7 +679,7 @@ async def health(_: web.Request) -> web.Response:
 
 async def stats(_: web.Request) -> web.Response:
     data = stats_payload()
-    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v6</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
+    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v7</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
     return web.Response(text=html, content_type="text/html")
 
 
@@ -680,7 +699,7 @@ async def heartbeat() -> None:
     while not STOP.is_set():
         await asyncio.sleep(300)
         d = stats_payload()
-        log.info("HEARTBEAT events=%s active_bull=%s active_bear=%s touches=%s sent=%s rejected=%s", d["events"], d["active_bull"], d["active_bear"], d["touches_detected"], d["alerts_sent"], d["rejected_total"])
+        log.info("HEARTBEAT raw=%s events=%s ws_errors=%s active_bull=%s active_bear=%s touches=%s sent=%s rejected=%s", d["raw_ws_messages"], d["events"], d["ws_errors"], d["active_bull"], d["active_bear"], d["touches_detected"], d["alerts_sent"], d["rejected_total"])
 
 async def main() -> None:
     global SESSION
