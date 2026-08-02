@@ -1,22 +1,23 @@
-Ahmed Order Flow Intelligence Pro v6
+Ahmed Order Flow Intelligence Pro v11
 
-Railway Variables:
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=-100...
-MIN_SCORE=85
+الملفات المطلوبة في GitHub:
+- app.py
+- requirements.txt
+- Procfile
+
+متغيرات Railway:
+TELEGRAM_BOT_TOKEN=توكن_البوت
+TELEGRAM_CHAT_ID=-100رقم_الشات
+MIN_SCORE=75
 MIN_STRONG_FACTORS=4
+FIRST_LIVE_TOUCH_ONLY=true
 COOLDOWN_HOURS=12
-SEND_TEST_MESSAGES=true
+STREAMS_PER_WS=180
 DEBUG_BLOCKS=true
+SEND_TEST_MESSAGES=false
 
-بعد وصول رسائل الاختبار غيّر SEND_TEST_MESSAGES=false.
-
-المسارات:
-/health  بيانات JSON
-/stats   صفحة إحصائيات
-
-سجلات مهمة:
-TOUCH_DETECTED = تم اكتشاف لمس
-REJECT reason=... = سبب عدم الإرسال
-TELEGRAM sent=True = تم إرسال التنبيه
-HEARTBEAT = ملخص كل 5 دقائق
+التحديث الرئيسي في v11:
+- رسالة Telegram أوضح وأقصر.
+- نوع الفرصة: ارتداد (Reversal).
+- التقييم بصيغة 94/100 بدل 94%.
+- عرض العوامل المتحققة في سطر مختصر.
