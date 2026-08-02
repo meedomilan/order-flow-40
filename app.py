@@ -14,7 +14,7 @@ import aiohttp
 from aiohttp import web
 
 # ============================================================
-# Ahmed Order Flow Intelligence v3
+# Ahmed Order Flow Intelligence Pro v4
 # Binance USDT-M Futures -> Telegram
 # 15m / 1h / 4h | Bullish OF / Bearish OF only
 # ============================================================
@@ -26,8 +26,11 @@ TF_LABEL = {"15m": "15 دقيقة", "1h": "ساعة", "4h": "4 ساعات"}
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "80"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "85"))
 SEND_TEST_MESSAGES = os.getenv("SEND_TEST_MESSAGES", "true").lower() == "true"
+MIN_STRONG_FACTORS = int(os.getenv("MIN_STRONG_FACTORS", "4"))
+COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "12"))
+DEBUG_BLOCKS = os.getenv("DEBUG_BLOCKS", "true").lower() == "true"
 
 OF_SWING = int(os.getenv("OF_SWING", "4"))
 OF_ATR_LEN = int(os.getenv("OF_ATR_LEN", "14"))
@@ -35,8 +38,8 @@ OF_IMPULSE = float(os.getenv("OF_IMPULSE", "0.70"))
 ZONE_SOURCE = os.getenv("ZONE_SOURCE", "Body + Wick")
 BREAK_BY_CLOSE = os.getenv("BREAK_BY_CLOSE", "true").lower() == "true"
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "220"))
-REST_CONCURRENCY = int(os.getenv("REST_CONCURRENCY", "4"))
-REST_GAP = float(os.getenv("REST_GAP", "0.10"))
+REST_CONCURRENCY = int(os.getenv("REST_CONCURRENCY", "2"))
+REST_GAP = float(os.getenv("REST_GAP", "0.22"))
 STREAMS_PER_WS = int(os.getenv("STREAMS_PER_WS", "450"))
 
 REST_BASES = [
@@ -53,7 +56,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("ahmed-of-v3")
+log = logging.getLogger("ahmed-of-v4")
 
 SESSION: Optional[aiohttp.ClientSession] = None
 STOP = asyncio.Event()
@@ -62,6 +65,11 @@ STATES: Dict[str, "ZoneState"] = {}
 PENDING: Dict[str, "PendingConfirmation"] = {}
 DEDUP: set[str] = set()
 EVENT_COUNT = 0
+ZONE_COUNT = 0
+TOUCH_COUNT = 0
+SENT_COUNT = 0
+REJECT_COUNT = 0
+LAST_ALERT_AT: Dict[str, float] = {}
 
 
 @dataclass
@@ -150,14 +158,14 @@ def pivot_low(c: List[Candle], i: int, n: int) -> bool:
     if i - n < 0 or i + n >= len(c):
         return False
     v = c[i].low
-    return v < min(x.low for x in c[i-n:i]) and v <= min(x.low for x in c[i+1:i+n+1])
+    return v <= min(x.low for x in c[i-n:i]) and v <= min(x.low for x in c[i+1:i+n+1])
 
 
 def pivot_high(c: List[Candle], i: int, n: int) -> bool:
     if i - n < 0 or i + n >= len(c):
         return False
     v = c[i].high
-    return v > max(x.high for x in c[i-n:i]) and v >= max(x.high for x in c[i+1:i+n+1])
+    return v >= max(x.high for x in c[i-n:i]) and v >= max(x.high for x in c[i+1:i+n+1])
 
 
 def fvg_present(c: List[Candle], idx: int, side: str) -> bool:
@@ -281,30 +289,32 @@ async def market_confirmation(symbol: str, tf: str, side: str) -> dict:
     return result
 
 
-def score_block(local: dict, market: dict, first_test: bool) -> tuple[int, List[str], List[str]]:
-    score = 25  # صلاحية البنية والاندفاع الأصلي
-    yes, no = ["بنية OF + اندفاع ATR"], []
+def score_block(local: dict, market: dict, first_test: bool) -> tuple[int, List[str], List[str], int]:
+    # الدرجة ليست احتمال نجاح؛ هي جودة توافق العوامل الحالية.
+    score = 35  # تكوّن OF مطابق للمؤشر + اندفاع ATR
+    yes, no = ["OF + ATR"], []
     factors = [
-        (first_test, 15, "الاختبار الأول"),
-        (local["freshness"], 8, "بلوك حديث"),
-        (local["sweep"], 12, "Liquidity Sweep"),
+        (first_test, 12, "أول اختبار"),
+        (local["freshness"], 6, "حديث"),
+        (local["sweep"], 12, "Sweep"),
         (local["absorption"], 10, "Absorption"),
-        (local["delta_ok"], 8, "Delta مؤيد"),
-        (local["cvd_ok"], 7, "CVD مؤيد"),
-        (local["volume_spike"], 6, "Volume Spike"),
-        (local["fvg"], 4, "FVG متداخل"),
-        (market["oi_up"], 3, "OI يرتفع"),
-        (market["book_ok"], 2, "Order Book مؤيد"),
+        (local["delta_ok"], 9, "Delta"),
+        (local["cvd_ok"], 8, "CVD"),
+        (local["volume_spike"], 7, "Volume"),
+        (local["fvg"], 5, "FVG"),
+        (market["oi_up"], 4, "OI"),
+        (market["book_ok"], 4, "OrderBook"),
     ]
+    strong = 0
     for ok, points, name in factors:
         if ok:
             score += points
             yes.append(name)
+            if name not in ("أول اختبار", "حديث"):
+                strong += 1
         else:
             no.append(name)
-    score = min(100, score)
-    return score, yes, no
-
+    return min(100, score), yes, no, strong
 
 def links(symbol: str) -> str:
     tv = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}.P"
@@ -314,43 +324,33 @@ def links(symbol: str) -> str:
 
 def touch_message(symbol: str, tf: str, side: str, bottom: float, top: float, price: float, score: int, local: dict, market: dict, yes: List[str], no: List[str]) -> str:
     bull = side == "bull"
-    title = "🟢 <b>دخول بلوك شرائي قوي — Bullish OF</b>" if bull else "🔴 <b>دخول بلوك بيعي قوي — Bearish OF</b>"
-    quality = "قوي جدًا" if score >= 90 else "قوي"
-    checks = "\n".join(f"✅ {x}" for x in yes[:8])
-    warnings = "\n".join(f"⚠️ {x}" for x in no[:3])
-    now = datetime.now(RIYADH).strftime("%d-%m-%Y %H:%M:%S")
+    title = "🟢 <b>Bullish OF قوي</b>" if bull else "🔴 <b>Bearish OF قوي</b>"
+    factors = " • ".join(yes[1:6])
+    now = datetime.now(RIYADH).strftime("%d-%m-%Y %H:%M")
     return (
         f"{title}\n\n"
-        f"💰 العملة: <b>#{symbol}.P</b>\n"
-        f"⏰ الفريم: <b>{TF_LABEL[tf]}</b>\n"
-        f"💵 السعر: <b>{fmt(price)}</b>\n"
-        f"🧱 المنطقة: <b>{fmt(bottom)} — {fmt(top)}</b>\n\n"
-        f"💪 الجودة: <b>{score}% — {quality}</b>\n"
-        f"🧪 الاختبار: <b>الأول</b>\n"
-        f"⏳ عمر البلوك: <b>{local['age']} شموع</b>\n\n"
-        f"{checks}\n{warnings}\n\n"
-        f"🧊 Iceberg محتمل: <b>{'نعم' if market['iceberg'] else 'لا'}</b>\n"
-        f"🎯 POC التقريبي: <b>{fmt((bottom + top) / 2)}</b>\n\n"
-        f"🕒 {now} (السعودية)\n{links(symbol)}\n\n"
-        f"⚠️ تقييم إحصائي وليس ضمانًا للانعكاس"
+        f"💰 <b>#{symbol}.P</b> | ⏰ <b>{TF_LABEL[tf]}</b>\n"
+        f"💵 <b>{fmt(price)}</b> | 💪 <b>{score}%</b>\n"
+        f"🧱 <b>{fmt(bottom)} — {fmt(top)}</b>\n"
+        f"✅ {factors}\n"
+        f"🧪 أول اختبار | ⏳ {local['age']} شموع\n"
+        f"🕒 {now} السعودية\n"
+        f"{links(symbol)}\n"
+        f"⚠️ جودة إحصائية وليست ضمانًا"
     )
-
 
 def confirmation_message(p: PendingConfirmation, price: float, evidence: List[str]) -> str:
     bull = p.side == "bull"
-    title = "🚀 <b>تأكيد ارتداد من البلوك الشرائي</b>" if bull else "📉 <b>تأكيد هبوط من البلوك البيعي</b>"
-    now = datetime.now(RIYADH).strftime("%d-%m-%Y %H:%M:%S")
-    checks = "\n".join(f"✅ {x}" for x in evidence)
+    title = "🚀 <b>تأكيد ارتداد شرائي</b>" if bull else "📉 <b>تأكيد هبوط بيعي</b>"
+    checks = " • ".join(evidence[:4])
+    now = datetime.now(RIYADH).strftime("%d-%m-%Y %H:%M")
     return (
         f"{title}\n\n"
-        f"💰 العملة: <b>#{p.symbol}.P</b>\n"
-        f"⏰ الفريم: <b>{TF_LABEL[p.timeframe]}</b>\n"
-        f"💵 سعر التأكيد: <b>{fmt(price)}</b>\n"
-        f"💪 جودة البلوك الأصلية: <b>{p.score}%</b>\n\n"
-        f"{checks}\n\n"
-        f"🕒 {now} (السعودية)\n{links(p.symbol)}"
+        f"💰 <b>#{p.symbol}.P</b> | ⏰ <b>{TF_LABEL[p.timeframe]}</b>\n"
+        f"💵 <b>{fmt(price)}</b> | 💪 <b>{p.score}%</b>\n"
+        f"✅ {checks}\n"
+        f"🕒 {now} السعودية\n{links(p.symbol)}"
     )
-
 
 def rebuild(c: List[Candle]) -> ZoneState:
     s = ZoneState()
@@ -360,6 +360,7 @@ def rebuild(c: List[Candle]) -> ZoneState:
 
 
 def apply_bar(c: List[Candle], i: int, s: ZoneState, emit: bool) -> List[dict]:
+    global ZONE_COUNT, TOUCH_COUNT
     out = []
     current = c[i]
     a = atr(c[:i+1], OF_ATR_LEN)
@@ -374,6 +375,8 @@ def apply_bar(c: List[Candle], i: int, s: ZoneState, emit: bool) -> List[dict]:
             s.bull_top, s.bull_bottom = top, bottom
             s.bull_created, s.bull_created_index = p.open_time, candidate
             s.bull_broken, s.bull_inside, s.bull_tests = False, False, 0
+            if emit:
+                ZONE_COUNT += 1
     if candidate >= OF_SWING and pivot_high(c, candidate, OF_SWING):
         p = c[candidate]
         top = max(p.open, p.close) if ZONE_SOURCE == "Candle Body" else p.high
@@ -382,16 +385,20 @@ def apply_bar(c: List[Candle], i: int, s: ZoneState, emit: bool) -> List[dict]:
             s.bear_top, s.bear_bottom = top, bottom
             s.bear_created, s.bear_created_index = p.open_time, candidate
             s.bear_broken, s.bear_inside, s.bear_tests = False, False, 0
+            if emit:
+                ZONE_COUNT += 1
 
     inside_bull = not s.bull_broken and s.bull_top is not None and current.high >= s.bull_bottom and current.low <= s.bull_top
     inside_bear = not s.bear_broken and s.bear_top is not None and current.high >= s.bear_bottom and current.low <= s.bear_top
     if inside_bull and not s.bull_inside:
         s.bull_tests += 1
         if emit:
+            TOUCH_COUNT += 1
             out.append({"side": "bull", "bottom": s.bull_bottom, "top": s.bull_top, "tests": s.bull_tests, "created": s.bull_created, "created_index": s.bull_created_index})
     if inside_bear and not s.bear_inside:
         s.bear_tests += 1
         if emit:
+            TOUCH_COUNT += 1
             out.append({"side": "bear", "bottom": s.bear_bottom, "top": s.bear_top, "tests": s.bear_tests, "created": s.bear_created, "created_index": s.bear_created_index})
     s.bull_inside, s.bear_inside = inside_bull, inside_bear
 
@@ -403,24 +410,35 @@ def apply_bar(c: List[Candle], i: int, s: ZoneState, emit: bool) -> List[dict]:
 
 
 async def handle_touch(symbol: str, tf: str, c: List[Candle], event: dict) -> None:
+    global SENT_COUNT, REJECT_COUNT
     if event["tests"] != 1:
         return
     side = event["side"]
     dedup = f"{symbol}:{tf}:{side}:{event['created']}"
+    cooldown_key = f"{symbol}:{tf}"
     if dedup in DEDUP:
+        return
+    if time.time() - LAST_ALERT_AT.get(cooldown_key, 0) < COOLDOWN_HOURS * 3600:
+        REJECT_COUNT += 1
+        if DEBUG_BLOCKS:
+            log.info("REJECT cooldown %s %s %s", symbol, tf, side)
         return
     local = local_metrics(c, side, float(event["bottom"]), float(event["top"]), int(event["created_index"] or 0))
     market = await market_confirmation(symbol, tf, side)
-    score, yes, no = score_block(local, market, True)
-    log.info("Block touch %s %s %s score=%s", symbol, tf, side, score)
-    if score < MIN_SCORE:
-        log.info("Skipped below MIN_SCORE: %s %s %s", symbol, tf, score)
+    score, yes, no, strong = score_block(local, market, True)
+    log.info("TOUCH %s %s %s score=%s factors=%s zone=%s-%s", symbol, tf, side, score, strong, fmt(float(event['bottom'])), fmt(float(event['top'])))
+    if score < MIN_SCORE or strong < MIN_STRONG_FACTORS:
+        REJECT_COUNT += 1
+        if DEBUG_BLOCKS:
+            log.info("REJECT %s %s score=%s/%s factors=%s/%s missing=%s", symbol, tf, score, MIN_SCORE, strong, MIN_STRONG_FACTORS, ','.join(no[:6]))
         return
     DEDUP.add(dedup)
+    LAST_ALERT_AT[cooldown_key] = time.time()
     text = touch_message(symbol, tf, side, float(event["bottom"]), float(event["top"]), c[-1].close, score, local, market, yes, no)
     ok = await telegram(text)
-    log.info("Telegram touch sent=%s %s %s", ok, symbol, tf)
+    log.info("TELEGRAM sent=%s %s %s", ok, symbol, tf)
     if ok:
+        SENT_COUNT += 1
         PENDING[key(symbol, tf)] = PendingConfirmation(symbol, tf, side, float(event["bottom"]), float(event["top"]), score, int(time.time()*1000))
 
 
@@ -561,10 +579,10 @@ async def test_messages(symbol_count: int) -> None:
         "✅ <b>Ahmed Order Flow Intelligence بدأ العمل</b>\n\n"
         f"💹 العقود: <b>{symbol_count} Binance USDT Futures</b>\n"
         "⏰ الفريمات: <b>15m — 1H — 4H</b>\n"
-        f"🎯 الحد الأدنى للجودة: <b>{MIN_SCORE}%</b>\n"
+        f"🎯 الجودة: <b>{MIN_SCORE}%+</b> | العوامل: <b>{MIN_STRONG_FACTORS}+</b>\n"
         "🧪 أول اختبار فقط\n"
         "🔁 منع التكرار مفعل\n"
-        "📩 تنبيه دخول + تنبيه تأكيد فقط"
+        f"⏳ منع التكرار: <b>{COOLDOWN_HOURS} ساعة</b>\n📩 رسالة مختصرة + تأكيد فقط"
     )
     await telegram(start)
     await telegram(
@@ -580,7 +598,7 @@ async def test_messages(symbol_count: int) -> None:
 
 
 async def health(_: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "states": len(STATES), "events": EVENT_COUNT, "pending": len(PENDING), "telegram": bool(BOT_TOKEN and CHAT_ID)})
+    return web.json_response({"ok": True, "states": len(STATES), "events": EVENT_COUNT, "zones": ZONE_COUNT, "touches": TOUCH_COUNT, "sent": SENT_COUNT, "rejected": REJECT_COUNT, "pending": len(PENDING), "telegram": bool(BOT_TOKEN and CHAT_ID)})
 
 
 async def start_health() -> web.AppRunner:
