@@ -14,7 +14,7 @@ import aiohttp
 from aiohttp import web
 
 # ============================================================
-# Ahmed Order Flow Intelligence Pro v7
+# Ahmed Order Flow Intelligence Pro v8
 # Binance USDT-M Futures -> Telegram
 # 15m / 1h / 4h | Bullish OF / Bearish OF only
 # ============================================================
@@ -52,14 +52,14 @@ REST_BASES = [
     "https://fapi3.binance.com",
     "https://fapi4.binance.com",
 ]
-WS_BASE = os.getenv("BINANCE_WS_BASE", "wss://fstream.binance.com/stream?streams=")
+WS_BASE = os.getenv("BINANCE_WS_BASE", "wss://fstream.binance.com/ws")
 TG_API = "https://api.telegram.org"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("ahmed-of-v7")
+log = logging.getLogger("ahmed-of-v8")
 
 SESSION: Optional[aiohttp.ClientSession] = None
 STOP = asyncio.Event()
@@ -70,6 +70,8 @@ DEDUP: set[str] = set()
 EVENT_COUNT = 0
 RAW_WS_COUNT = 0
 WS_ERROR_COUNT = 0
+SUBSCRIPTION_ACK_COUNT = 0
+LAST_WS_MESSAGE_AT: Optional[float] = None
 ZONE_COUNT = 0
 TOUCH_COUNT = 0
 SENT_COUNT = 0
@@ -586,44 +588,83 @@ async def warmup(symbols: List[str]) -> None:
 
 
 async def ws_worker(streams: List[str], wid: int) -> None:
-    global RAW_WS_COUNT, WS_ERROR_COUNT
+    global RAW_WS_COUNT, WS_ERROR_COUNT, SUBSCRIPTION_ACK_COUNT, LAST_WS_MESSAGE_AT
     assert SESSION is not None
-    # Combined Stream: الاشتراك موجود داخل الرابط نفسه، لذلك لا نعتمد على
-    # رسائل SUBSCRIBE التي كانت تتصل دون أن تستقبل أحداثًا على Railway.
-    url = WS_BASE + "/".join(streams)
+
+    # نستخدم اتصال /ws ثم اشتراكًا رسميًا بعد الاتصال.
+    # هذا يتجنب روابط Combined Streams الطويلة التي كانت تتصل دون استقبال بيانات.
     while not STOP.is_set():
         try:
             async with SESSION.ws_connect(
-                url,
-                heartbeat=60,
-                receive_timeout=180,
+                WS_BASE,
+                heartbeat=30,
+                receive_timeout=90,
                 max_msg_size=5_000_000,
                 autoclose=True,
                 autoping=True,
             ) as ws:
-                log.info("WS %s combined connected (%s streams)", wid, len(streams))
+                log.info("WS %s connected; subscribing to %s streams", wid, len(streams))
+
+                request_id = (wid * 100000) + 1
+                # Binance يسمح بعدد كبير من الاشتراكات، لكن التقسيم إلى دفعات أصغر أكثر ثباتًا.
+                for offset in range(0, len(streams), 100):
+                    batch = streams[offset:offset + 100]
+                    await ws.send_json({
+                        "method": "SUBSCRIBE",
+                        "params": batch,
+                        "id": request_id,
+                    })
+                    log.info(
+                        "WS %s subscribe sent id=%s streams=%s",
+                        wid, request_id, len(batch),
+                    )
+                    request_id += 1
+                    await asyncio.sleep(0.25)
+
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         RAW_WS_COUNT += 1
+                        LAST_WS_MESSAGE_AT = time.time()
                         try:
                             data = json.loads(msg.data)
+
+                            # رد الاشتراك الرسمي: {"result": null, "id": ...}
+                            if isinstance(data, dict) and "id" in data and "result" in data:
+                                if data.get("result") is None:
+                                    SUBSCRIPTION_ACK_COUNT += 1
+                                    log.info(
+                                        "WS %s subscription acknowledged id=%s total_acks=%s",
+                                        wid, data.get("id"), SUBSCRIPTION_ACK_COUNT,
+                                    )
+                                else:
+                                    WS_ERROR_COUNT += 1
+                                    log.warning("WS %s subscription rejected: %s", wid, data)
+                                continue
+
                             await process_event(data)
                             if RAW_WS_COUNT == 1 or RAW_WS_COUNT % 5000 == 0:
-                                log.info("WS raw messages=%s kline_events=%s", RAW_WS_COUNT, EVENT_COUNT)
+                                log.info(
+                                    "WS raw messages=%s kline_events=%s acks=%s",
+                                    RAW_WS_COUNT, EVENT_COUNT, SUBSCRIPTION_ACK_COUNT,
+                                )
                         except Exception:
                             WS_ERROR_COUNT += 1
-                            log.exception("WS event error wid=%s", wid)
+                            log.exception("WS event error wid=%s payload=%s", wid, msg.data[:300])
+
                     elif msg.type == aiohttp.WSMsgType.ERROR:
                         WS_ERROR_COUNT += 1
                         log.warning("WS %s message error: %s", wid, ws.exception())
                         break
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
+                        log.warning("WS %s closed by remote", wid)
                         break
+
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             WS_ERROR_COUNT += 1
             log.warning("WS %s disconnected: %s", wid, exc)
+
         if not STOP.is_set():
             await asyncio.sleep(5)
 
@@ -656,10 +697,12 @@ async def test_messages(symbol_count: int) -> None:
 def stats_payload() -> dict:
     return {
         "ok": True,
-        "version": "v7",
+        "version": "v8",
         "states": len(STATES),
         "raw_ws_messages": RAW_WS_COUNT,
         "ws_errors": WS_ERROR_COUNT,
+        "subscription_acks": SUBSCRIPTION_ACK_COUNT,
+        "last_ws_message_seconds_ago": (None if LAST_WS_MESSAGE_AT is None else round(time.time() - LAST_WS_MESSAGE_AT, 1)),
         "events": EVENT_COUNT,
         "zones_created_live": ZONE_COUNT,
         "touches_detected": TOUCH_COUNT,
@@ -679,7 +722,7 @@ async def health(_: web.Request) -> web.Response:
 
 async def stats(_: web.Request) -> web.Response:
     data = stats_payload()
-    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v7</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
+    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v8</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
     return web.Response(text=html, content_type="text/html")
 
 
