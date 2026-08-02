@@ -14,7 +14,7 @@ import aiohttp
 from aiohttp import web
 
 # ============================================================
-# Ahmed Order Flow Intelligence Pro v10
+# Ahmed Order Flow Intelligence Pro v11
 # Binance USDT-M Futures -> Telegram
 # 15m / 1h / 4h | Bullish OF / Bearish OF only
 # ============================================================
@@ -343,19 +343,35 @@ def links(symbol: str) -> str:
 
 def touch_message(symbol: str, tf: str, side: str, bottom: float, top: float, price: float, score: int, local: dict, market: dict, yes: List[str], no: List[str]) -> str:
     bull = side == "bull"
-    title = "🟢 <b>Bullish OF قوي</b>" if bull else "🔴 <b>Bearish OF قوي</b>"
-    factors = " • ".join(yes[1:6])
+    if score >= 95:
+        strength = "🔥 استثنائية"
+    elif score >= 85:
+        strength = "🟢 قوية"
+    else:
+        strength = "🟡 جيدة"
+
+    title = "🟢 <b>فرصة شراء من Order Flow</b>" if bull else "🔴 <b>فرصة بيع من Order Flow</b>"
+    # تنبيهات لمس البلوك في هذا المشروع هي فرص ارتداد من المنطقة، وليست تنبيهات اقتراب.
+    opportunity_type = "ارتداد (Reversal)"
+
+    # اعرض فقط العوامل التي تحققت، وبشكل مختصر مناسب للهاتف.
+    factor_names = [name for name in yes if name not in ("OF + ATR", "حديث")]
+    factor_names = ["First Touch" if name == "أول اختبار" else name for name in factor_names]
+    factors = " • ".join(factor_names[:8]) or "OF • ATR"
+
     now = datetime.now(RIYADH).strftime("%d-%m-%Y %H:%M")
     return (
         f"{title}\n\n"
         f"💰 <b>#{symbol}.P</b> | ⏰ <b>{TF_LABEL[tf]}</b>\n"
-        f"💵 <b>{fmt(price)}</b> | 💪 <b>{score}%</b>\n"
-        f"🧱 <b>{fmt(bottom)} — {fmt(top)}</b>\n"
+        f"💵 السعر: <b>{fmt(price)}</b>\n\n"
+        f"🧱 البلوك: <b>{fmt(bottom)} ➜ {fmt(top)}</b>\n"
+        f"🏷️ <b>{opportunity_type}</b>\n\n"
+        f"⭐ التقييم: <b>{score}/100</b> — {strength}\n"
         f"✅ {factors}\n"
-        f"🧪 أول اختبار | ⏳ {local['age']} شموع\n"
-        f"🕒 {now} السعودية\n"
+        f"⏳ عمر البلوك: <b>{local['age']} شموع</b>\n\n"
+        f"🕒 {now} (السعودية)\n"
         f"{links(symbol)}\n"
-        f"⚠️ جودة إحصائية وليست ضمانًا"
+        f"⚠️ تقييم جودة وليس ضمانًا للارتداد"
     )
 
 def confirmation_message(p: PendingConfirmation, price: float, evidence: List[str]) -> str:
@@ -366,7 +382,7 @@ def confirmation_message(p: PendingConfirmation, price: float, evidence: List[st
     return (
         f"{title}\n\n"
         f"💰 <b>#{p.symbol}.P</b> | ⏰ <b>{TF_LABEL[p.timeframe]}</b>\n"
-        f"💵 <b>{fmt(price)}</b> | 💪 <b>{p.score}%</b>\n"
+        f"💵 السعر: <b>{fmt(price)}</b> | ⭐ <b>{p.score}/100</b>\n"
         f"✅ {checks}\n"
         f"🕒 {now} السعودية\n{links(p.symbol)}"
     )
@@ -855,7 +871,7 @@ async def test_messages(symbol_count: int) -> None:
 def stats_payload() -> dict:
     return {
         "ok": True,
-        "version": "v10",
+        "version": "v11",
         "states": len(STATES),
         "raw_ws_messages": RAW_WS_COUNT,
         "ws_errors": WS_ERROR_COUNT,
@@ -885,7 +901,7 @@ async def health(_: web.Request) -> web.Response:
 
 async def stats(_: web.Request) -> web.Response:
     data = stats_payload()
-    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v10</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
+    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v11</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
     return web.Response(text=html, content_type="text/html")
 
 
