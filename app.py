@@ -7,6 +7,7 @@ import signal
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -14,7 +15,7 @@ import aiohttp
 from aiohttp import web
 
 # ============================================================
-# Ahmed Order Flow Intelligence Pro v13
+# Ahmed Order Flow Intelligence Pro v13.1
 # Binance USDT-M Futures -> Telegram
 # 15m / 1h / 4h | Bullish OF / Bearish OF only
 # ============================================================
@@ -41,9 +42,11 @@ BREAK_BY_CLOSE = os.getenv("BREAK_BY_CLOSE", "true").lower() == "true"
 OF_USE_VOL = os.getenv("OF_USE_VOL", "true").lower() == "true"
 OF_VOL_LEN = int(os.getenv("OF_VOL_LEN", "20"))
 OF_VOL_MULT = float(os.getenv("OF_VOL_MULT", "1.20"))
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "99"))
-REST_CONCURRENCY = int(os.getenv("REST_CONCURRENCY", "2"))
-REST_GAP = float(os.getenv("REST_GAP", "0.45"))
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "60"))
+REST_CONCURRENCY = int(os.getenv("REST_CONCURRENCY", "1"))
+REST_GAP = float(os.getenv("REST_GAP", "1.25"))
+REST_MIN_INTERVAL = float(os.getenv("REST_MIN_INTERVAL", "1.10"))
+REST_BAN_EXTRA_SECONDS = float(os.getenv("REST_BAN_EXTRA_SECONDS", "3"))
 STREAMS_PER_WS = int(os.getenv("STREAMS_PER_WS", "180"))
 FIRST_LIVE_TOUCH_ONLY = os.getenv("FIRST_LIVE_TOUCH_ONLY", "true").lower() == "true"
 
@@ -66,7 +69,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("ahmed-of-v13")
+log = logging.getLogger("ahmed-of-v13.1")
 
 SESSION: Optional[aiohttp.ClientSession] = None
 STOP = asyncio.Event()
@@ -96,6 +99,13 @@ MISSING_FACTORS: Dict[str, int] = {
 SCORE_BUCKETS: Dict[str, int] = {"under_60": 0, "60_74": 0, "75_84": 0, "85_94": 0, "95_100": 0}
 LAST_TOUCH_AT: Dict[str, float] = {}
 LAST_ALERT_AT: Dict[str, float] = {}
+REST_LOCK = asyncio.Lock()
+REST_LAST_REQUEST_AT = 0.0
+REST_BLOCKED_UNTIL = 0.0
+REST_REQUEST_COUNT = 0
+REST_RATE_LIMIT_COUNT = 0
+SYMBOL_CACHE_PATH = os.getenv("SYMBOL_CACHE_PATH", "/tmp/ahmed_of_symbols.json")
+
 
 
 @dataclass
@@ -285,26 +295,89 @@ def local_metrics(c: List[Candle], side: str, zone_bottom: float, zone_top: floa
 
 
 async def rest_get(path: str, params: Optional[dict] = None, attempts: int = 8):
+    """Rate-limited Binance REST request with 418/429 ban recovery.
+
+    All REST calls share one limiter so warm-up, price polling and confirmations
+    cannot collectively exceed a safe request rate. A Binance ban no longer
+    terminates the container; the service stays online and waits for expiry.
+    """
+    global REST_LAST_REQUEST_AT, REST_BLOCKED_UNTIL, REST_REQUEST_COUNT, REST_RATE_LIMIT_COUNT
     assert SESSION is not None
-    last = None
-    for attempt in range(attempts):
-        base = REST_BASES[attempt % len(REST_BASES)]
-        try:
-            async with SESSION.get(base + path, params=params, timeout=30) as r:
-                if r.status == 200:
-                    return await r.json()
-                body = (await r.text())[:250]
-                if r.status in (418, 429, 451) or r.status >= 500:
-                    wait = min(45, 2 ** min(attempt, 5)) + random.random()
-                    log.warning("Binance HTTP %s, retry %.1fs: %s", r.status, wait, body)
-                    await asyncio.sleep(wait)
-                    continue
-                raise RuntimeError(f"HTTP {r.status}: {body}")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            last = exc
-            await asyncio.sleep(min(20, 1.5 * (attempt + 1)))
+    last: Optional[Exception] = None
+
+    for attempt in range(max(1, attempts)):
+        if STOP.is_set():
+            raise asyncio.CancelledError
+
+        async with REST_LOCK:
+            now = time.time()
+            if REST_BLOCKED_UNTIL > now:
+                wait = REST_BLOCKED_UNTIL - now
+                log.warning("Binance REST paused %.1fs until ban window expires", wait)
+                try:
+                    await asyncio.wait_for(STOP.wait(), timeout=wait)
+                    raise asyncio.CancelledError
+                except asyncio.TimeoutError:
+                    pass
+
+            gap = REST_MIN_INTERVAL - (time.monotonic() - REST_LAST_REQUEST_AT)
+            if gap > 0:
+                await asyncio.sleep(gap)
+
+            # Do not rotate hosts on every attempt: Binance limits are IP-wide,
+            # and rapid host rotation can multiply retries during a ban.
+            base = REST_BASES[min(attempt, len(REST_BASES) - 1)]
+            try:
+                REST_LAST_REQUEST_AT = time.monotonic()
+                REST_REQUEST_COUNT += 1
+                async with SESSION.get(base + path, params=params, timeout=30) as r:
+                    body = await r.text()
+                    if r.status == 200:
+                        try:
+                            return json.loads(body)
+                        except json.JSONDecodeError as exc:
+                            last = exc
+                            log.warning("Binance returned invalid JSON for %s", path)
+                    elif r.status in (418, 429):
+                        REST_RATE_LIMIT_COUNT += 1
+                        # Binance error -1003 often includes: banned until <epoch_ms>
+                        import re
+                        match = re.search(r"banned until\s+(\d+)", body)
+                        if match:
+                            epoch = int(match.group(1))
+                            if epoch > 10_000_000_000:
+                                epoch /= 1000.0
+                            REST_BLOCKED_UNTIL = max(
+                                REST_BLOCKED_UNTIL,
+                                epoch + REST_BAN_EXTRA_SECONDS,
+                            )
+                        else:
+                            retry_after = float(r.headers.get("Retry-After", "0") or 0)
+                            REST_BLOCKED_UNTIL = max(
+                                REST_BLOCKED_UNTIL,
+                                time.time() + max(retry_after, min(300.0, 15.0 * (attempt + 1))),
+                            )
+                        log.warning(
+                            "Binance HTTP %s on %s; REST paused until %s: %s",
+                            r.status,
+                            path,
+                            datetime.fromtimestamp(REST_BLOCKED_UNTIL, RIYADH).strftime("%H:%M:%S"),
+                            body[:240],
+                        )
+                    elif r.status == 451 or r.status >= 500 or r.status == 202:
+                        last = RuntimeError(f"HTTP {r.status}: {body[:250]}")
+                        log.warning("Binance HTTP %s on %s; retrying", r.status, path)
+                    else:
+                        raise RuntimeError(f"HTTP {r.status}: {body[:250]}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last = exc
+                log.warning("Binance request error %s attempt=%s: %s", path, attempt + 1, exc)
+
+        # Sleep outside the lock so cancellation and health endpoints stay responsive.
+        await asyncio.sleep(min(60.0, 2.0 ** min(attempt, 5)) + random.random())
+
     raise RuntimeError(f"Binance request failed {path}: {last}")
 
 
@@ -682,8 +755,43 @@ async def process_event(payload: dict) -> None:
 
 
 async def symbols_list() -> List[str]:
-    data = await rest_get("/fapi/v1/exchangeInfo", attempts=12)
-    return sorted({x["symbol"] for x in data.get("symbols", []) if x.get("contractType") == "PERPETUAL" and x.get("quoteAsset") == "USDT" and x.get("status") == "TRADING"})
+    """Return active USDT perpetual symbols without crashing during an IP ban."""
+    cache = Path(SYMBOL_CACHE_PATH)
+
+    # Prefer a fresh cache on container restarts to avoid an unnecessary exchangeInfo call.
+    try:
+        if cache.exists() and time.time() - cache.stat().st_mtime < 7 * 86400:
+            cached = json.loads(cache.read_text())
+            if isinstance(cached, list) and len(cached) >= 100:
+                log.info("Loaded %s symbols from cache", len(cached))
+                return sorted({str(x) for x in cached})
+    except Exception as exc:
+        log.warning("Symbol cache read failed: %s", exc)
+
+    while not STOP.is_set():
+        try:
+            data = await rest_get("/fapi/v1/exchangeInfo", attempts=20)
+            symbols = sorted({
+                x["symbol"] for x in data.get("symbols", [])
+                if x.get("contractType") == "PERPETUAL"
+                and x.get("quoteAsset") == "USDT"
+                and x.get("status") == "TRADING"
+            })
+            if symbols:
+                try:
+                    cache.write_text(json.dumps(symbols))
+                except Exception as exc:
+                    log.warning("Symbol cache write failed: %s", exc)
+                return symbols
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("exchangeInfo unavailable; retrying in 60s: %s", exc)
+            try:
+                await asyncio.wait_for(STOP.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                pass
+    return []
 
 
 async def fetch_history(sem: asyncio.Semaphore, symbol: str, tf: str):
@@ -700,18 +808,27 @@ async def fetch_history(sem: asyncio.Semaphore, symbol: str, tf: str):
 
 
 async def warmup(symbols: List[str]) -> None:
-    sem = asyncio.Semaphore(REST_CONCURRENCY)
-    jobs = [fetch_history(sem, s, tf) for s in symbols for tf in TIMEFRAMES]
-    total, done = len(jobs), 0
-    log.info("Warming %s symbol/timeframe states...", total)
+    """Hydrate states at a deliberately safe rate.
+
+    A failed symbol/timeframe is skipped and retried later by candle_refresh_loop;
+    one blocked request can no longer stop the whole Railway deployment.
+    """
+    sem = asyncio.Semaphore(max(1, REST_CONCURRENCY))
+    jobs = [fetch_history(sem, symbol, tf) for symbol in symbols for tf in TIMEFRAMES]
+    total, done, loaded = len(jobs), 0, 0
+    log.info("Warming %s symbol/timeframe states at safe REST rate...", total)
     for fut in asyncio.as_completed(jobs):
+        if STOP.is_set():
+            break
         symbol, tf, candles = await fut
         done += 1
         if candles:
             BUFFERS[key(symbol, tf)] = candles
             STATES[key(symbol, tf)] = rebuild(candles)
-        if done % 100 == 0 or done == total:
-            log.info("Warm-up progress: %s/%s", done, total)
+            loaded += 1
+        if done % 50 == 0 or done == total:
+            log.info("Warm-up progress: %s/%s loaded=%s", done, total, loaded)
+    log.info("Warm-up finished loaded=%s failed=%s", loaded, max(0, total - loaded))
 
 
 async def ws_worker(streams: List[str], wid: int) -> None:
@@ -883,7 +1000,7 @@ async def ticker_price_poller() -> None:
         except Exception as exc:
             log.warning('Ticker price poll failed: %s', exc)
 
-        delay = max(1.0, 3.0 - (time.monotonic() - started))
+        delay = max(2.0, 12.0 - (time.monotonic() - started))
         try:
             await asyncio.wait_for(STOP.wait(), timeout=delay)
         except asyncio.TimeoutError:
@@ -947,7 +1064,7 @@ async def candle_refresh_loop(symbols: List[str]) -> None:
         index = (index + 1) % len(items)
         await refresh_one_state(symbol, tf)
         try:
-            await asyncio.wait_for(STOP.wait(), timeout=0.65)
+            await asyncio.wait_for(STOP.wait(), timeout=1.5)
         except asyncio.TimeoutError:
             pass
 
@@ -980,7 +1097,7 @@ async def test_messages(symbol_count: int) -> None:
 def stats_payload() -> dict:
     return {
         "ok": True,
-        "version": "v13",
+        "version": "v13.1",
         "states": len(STATES),
         "raw_ws_messages": RAW_WS_COUNT,
         "ws_errors": WS_ERROR_COUNT,
@@ -990,6 +1107,9 @@ def stats_payload() -> dict:
         "price_events": PRICE_EVENT_COUNT,
         "last_price_update_seconds_ago": (None if LAST_PRICE_UPDATE_AT is None else round(time.time() - LAST_PRICE_UPDATE_AT, 1)),
         "live_prices": len(LIVE_PRICES),
+        "rest_requests": REST_REQUEST_COUNT,
+        "rest_rate_limits": REST_RATE_LIMIT_COUNT,
+        "rest_blocked_seconds": round(max(0.0, REST_BLOCKED_UNTIL - time.time()), 1),
         "events": EVENT_COUNT,
         "zones_created_live": ZONE_COUNT,
         "touches_detected": TOUCH_COUNT,
@@ -1017,7 +1137,7 @@ async def health(_: web.Request) -> web.Response:
 
 async def stats(_: web.Request) -> web.Response:
     data = stats_payload()
-    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v13</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
+    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v13.1</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
     return web.Response(text=html, content_type="text/html")
 
 
