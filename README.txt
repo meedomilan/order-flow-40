@@ -1,25 +1,24 @@
-Ahmed Order Flow Intelligence Pro v12
+Ahmed Order Flow Intelligence Pro v13
 
-الملفات:
-- app.py
-- requirements.txt
-- Procfile
+يراقب جميع Binance USDT Futures على 15m و1h و4h.
+
+V13 يقوي تكوين البلوك عبر:
+- اندفاع افتراضي 1.20 ATR
+- كسر هيكل BOS/CHoCH قبل اعتماد المنطقة
+- حجم انطلاق أعلى من المتوسط
+- أول لمس حي فقط
+- اشتراط دفاع حي عند اللمس (Delta أو Sweep أو Absorption)
+- إلغاء المنطقة عند الإغلاق خلف حدها
 
 متغيرات Railway المقترحة:
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=-100...
 MIN_SCORE=75
-MIN_STRONG_FACTORS=4
 FACTOR_GATE_ENABLED=false
 FIRST_LIVE_TOUCH_ONLY=true
-COOLDOWN_HOURS=12
-STREAMS_PER_WS=180
-DEBUG_BLOCKS=true
 SEND_TEST_MESSAGES=false
-
-ملاحظات V12:
-- التقييم أصبح موزونًا بدل الاعتماد الأساسي على عدد العوامل.
-- بوابة عدد العوامل متوقفة افتراضيًا عبر FACTOR_GATE_ENABLED=false.
-- /stats يعرض missing_factors_on_reject و score_buckets.
-- POC المستخدم تقدير شموعي يعتمد على أعلى شمعة حجمًا داخل نطاق البلوك، وليس Volume Profile tick-level كاملًا.
-- الدرجة تقييم جودة وليست ضمانًا أو احتمال نجاح مؤكدًا.
+OF_IMPULSE=1.20
+OF_USE_VOL=true
+OF_VOL_MULT=1.20
+REQUIRE_STRUCTURE_BREAK=true
+STRUCTURE_LOOKBACK=20
+MAX_ZONE_AGE=36
+REQUIRE_LIVE_DEFENSE=true
