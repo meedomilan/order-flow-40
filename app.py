@@ -14,7 +14,7 @@ import aiohttp
 from aiohttp import web
 
 # ============================================================
-# Ahmed Order Flow Intelligence Pro v5
+# Ahmed Order Flow Intelligence Pro v6
 # Binance USDT-M Futures -> Telegram
 # 15m / 1h / 4h | Bullish OF / Bearish OF only
 # ============================================================
@@ -59,7 +59,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("ahmed-of-v5")
+log = logging.getLogger("ahmed-of-v6")
 
 SESSION: Optional[aiohttp.ClientSession] = None
 STOP = asyncio.Event()
@@ -72,6 +72,8 @@ ZONE_COUNT = 0
 TOUCH_COUNT = 0
 SENT_COUNT = 0
 REJECT_COUNT = 0
+REJECT_REASONS: Dict[str, int] = {"score": 0, "factors": 0, "cooldown": 0, "duplicate": 0, "second_touch": 0}
+LAST_TOUCH_AT: Dict[str, float] = {}
 LAST_ALERT_AT: Dict[str, float] = {}
 
 
@@ -431,26 +433,43 @@ def apply_bar(c: List[Candle], i: int, s: ZoneState, emit: bool) -> List[dict]:
 
 async def handle_touch(symbol: str, tf: str, c: List[Candle], event: dict) -> None:
     global SENT_COUNT, REJECT_COUNT
-    if event["tests"] != 1:
-        return
     side = event["side"]
-    dedup = f"{symbol}:{tf}:{side}:{event['created']}"
+    touch_key = f"{symbol}:{tf}:{side}:{event['created']}"
+    # حماية من تكرار تحديثات نفس الشمعة الحية
+    if time.time() - LAST_TOUCH_AT.get(touch_key, 0) < 30:
+        return
+    LAST_TOUCH_AT[touch_key] = time.time()
+    log.info("TOUCH_DETECTED symbol=%s tf=%s side=%s test=%s zone=%s-%s", symbol, tf, side, event["tests"], fmt(float(event["bottom"])), fmt(float(event["top"])))
+    if event["tests"] != 1:
+        REJECT_COUNT += 1
+        REJECT_REASONS["second_touch"] += 1
+        log.info("REJECT reason=second_touch symbol=%s tf=%s side=%s test=%s", symbol, tf, side, event["tests"])
+        return
+    dedup = touch_key
     cooldown_key = f"{symbol}:{tf}"
     if dedup in DEDUP:
+        REJECT_COUNT += 1
+        REJECT_REASONS["duplicate"] += 1
+        log.info("REJECT reason=duplicate symbol=%s tf=%s side=%s", symbol, tf, side)
         return
     if time.time() - LAST_ALERT_AT.get(cooldown_key, 0) < COOLDOWN_HOURS * 3600:
         REJECT_COUNT += 1
-        if DEBUG_BLOCKS:
-            log.info("REJECT cooldown %s %s %s", symbol, tf, side)
+        REJECT_REASONS["cooldown"] += 1
+        log.info("REJECT reason=cooldown symbol=%s tf=%s side=%s", symbol, tf, side)
         return
     local = local_metrics(c, side, float(event["bottom"]), float(event["top"]), int(event["created_index"] or 0))
     market = await market_confirmation(symbol, tf, side)
     score, yes, no, strong = score_block(local, market, True)
     log.info("TOUCH %s %s %s score=%s factors=%s zone=%s-%s", symbol, tf, side, score, strong, fmt(float(event['bottom'])), fmt(float(event['top'])))
-    if score < MIN_SCORE or strong < MIN_STRONG_FACTORS:
+    if score < MIN_SCORE:
         REJECT_COUNT += 1
-        if DEBUG_BLOCKS:
-            log.info("REJECT %s %s score=%s/%s factors=%s/%s missing=%s", symbol, tf, score, MIN_SCORE, strong, MIN_STRONG_FACTORS, ','.join(no[:6]))
+        REJECT_REASONS["score"] += 1
+        log.info("REJECT reason=score symbol=%s tf=%s side=%s score=%s required=%s missing=%s", symbol, tf, side, score, MIN_SCORE, ','.join(no[:6]))
+        return
+    if strong < MIN_STRONG_FACTORS:
+        REJECT_COUNT += 1
+        REJECT_REASONS["factors"] += 1
+        log.info("REJECT reason=factors symbol=%s tf=%s side=%s factors=%s required=%s missing=%s", symbol, tf, side, strong, MIN_STRONG_FACTORS, ','.join(no[:6]))
         return
     DEDUP.add(dedup)
     LAST_ALERT_AT[cooldown_key] = time.time()
@@ -617,20 +636,51 @@ async def test_messages(symbol_count: int) -> None:
     )
 
 
+def stats_payload() -> dict:
+    return {
+        "ok": True,
+        "version": "v6",
+        "states": len(STATES),
+        "events": EVENT_COUNT,
+        "zones_created_live": ZONE_COUNT,
+        "touches_detected": TOUCH_COUNT,
+        "alerts_sent": SENT_COUNT,
+        "rejected_total": REJECT_COUNT,
+        "rejected_reasons": dict(REJECT_REASONS),
+        "pending_confirmations": len(PENDING),
+        "active_bull": sum(1 for st in STATES.values() if not st.bull_broken and st.bull_top is not None),
+        "active_bear": sum(1 for st in STATES.values() if not st.bear_broken and st.bear_top is not None),
+        "telegram_configured": bool(BOT_TOKEN and CHAT_ID),
+        "minimum_score": MIN_SCORE,
+        "minimum_strong_factors": MIN_STRONG_FACTORS,
+    }
+
 async def health(_: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "states": len(STATES), "events": EVENT_COUNT, "zones": ZONE_COUNT, "touches": TOUCH_COUNT, "sent": SENT_COUNT, "rejected": REJECT_COUNT, "pending": len(PENDING), "active_bull": sum(1 for st in STATES.values() if not st.bull_broken and st.bull_top is not None), "active_bear": sum(1 for st in STATES.values() if not st.bear_broken and st.bear_top is not None), "telegram": bool(BOT_TOKEN and CHAT_ID)})
+    return web.json_response(stats_payload())
+
+async def stats(_: web.Request) -> web.Response:
+    data = stats_payload()
+    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v6</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
+    return web.Response(text=html, content_type="text/html")
 
 
 async def start_health() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+    app.router.add_get("/stats", stats)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     log.info("Health server running on port %s", PORT)
     return runner
 
+
+async def heartbeat() -> None:
+    while not STOP.is_set():
+        await asyncio.sleep(300)
+        d = stats_payload()
+        log.info("HEARTBEAT events=%s active_bull=%s active_bear=%s touches=%s sent=%s rejected=%s", d["events"], d["active_bull"], d["active_bear"], d["touches_detected"], d["alerts_sent"], d["rejected_total"])
 
 async def main() -> None:
     global SESSION
@@ -651,6 +701,7 @@ async def main() -> None:
         chunks = [streams[i:i+STREAMS_PER_WS] for i in range(0, len(streams), STREAMS_PER_WS)]
         log.info("Starting %s WebSocket connections", len(chunks))
         tasks = [asyncio.create_task(ws_worker(chunk, i+1)) for i, chunk in enumerate(chunks)]
+        tasks.append(asyncio.create_task(heartbeat()))
         await STOP.wait()
         for t in tasks:
             t.cancel()
