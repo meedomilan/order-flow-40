@@ -1,5 +1,7 @@
 import asyncio
 import json
+import gzip
+import pickle
 import logging
 import os
 import random
@@ -15,7 +17,7 @@ import aiohttp
 from aiohttp import web
 
 # ============================================================
-# Ahmed Order Flow Intelligence Pro v14
+# Ahmed Order Flow Intelligence Pro v15 Stable
 # Binance USDT-M Futures -> Telegram
 # 15m / 1h / 4h | Bullish OF / Bearish OF only
 # ============================================================
@@ -60,6 +62,19 @@ SCORE_CAP_NO_SWEEP = int(os.getenv("SCORE_CAP_NO_SWEEP", "89"))
 SCORE_CAP_NO_ABSORPTION = int(os.getenv("SCORE_CAP_NO_ABSORPTION", "84"))
 SCORE_CAP_NO_POC = int(os.getenv("SCORE_CAP_NO_POC", "82"))
 
+# Stable architecture: WebSocket-first + progressive REST bootstrap + persistent cache.
+STATE_DIR = Path(os.getenv("STATE_DIR", "/data"))
+if not STATE_DIR.exists():
+    STATE_DIR = Path("/tmp/ahmed_of")
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+STATE_CACHE_PATH = STATE_DIR / "state_v15.pkl.gz"
+SYMBOL_CACHE_FILE = STATE_DIR / "symbols_v15.json"
+BOOTSTRAP_GAP_SECONDS = float(os.getenv("BOOTSTRAP_GAP_SECONDS", "3.5"))
+CANDLE_REFRESH_SECONDS = float(os.getenv("CANDLE_REFRESH_SECONDS", "15"))
+STATE_SAVE_SECONDS = float(os.getenv("STATE_SAVE_SECONDS", "60"))
+MIN_DISCOVERED_SYMBOLS = int(os.getenv("MIN_DISCOVERED_SYMBOLS", "100"))
+DISCOVERY_WS = os.getenv("DISCOVERY_WS", "wss://fstream.binance.com/ws/!miniTicker@arr")
+
 REST_BASES = [
     "https://fapi.binance.com",
     "https://fapi1.binance.com",
@@ -74,7 +89,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("ahmed-of-v14")
+log = logging.getLogger("ahmed-of-v15")
 
 SESSION: Optional[aiohttp.ClientSession] = None
 STOP = asyncio.Event()
@@ -111,6 +126,10 @@ REST_REQUEST_COUNT = 0
 REST_RATE_LIMIT_COUNT = 0
 SYMBOL_CACHE_PATH = os.getenv("SYMBOL_CACHE_PATH", "/tmp/ahmed_of_symbols.json")
 BACKGROUND_TASKS: set[asyncio.Task] = set()
+BOOTSTRAP_DONE = 0
+BOOTSTRAP_TOTAL = 0
+CACHE_SAVES = 0
+DISCOVERY_MESSAGES = 0
 
 
 
@@ -818,44 +837,40 @@ async def process_event(payload: dict) -> None:
         await check_confirmation(symbol, tf, buf)
 
 
-async def symbols_list() -> List[str]:
-    """Return active USDT perpetual symbols without crashing during an IP ban."""
-    cache = Path(SYMBOL_CACHE_PATH)
-
-    # Prefer a fresh cache on container restarts to avoid an unnecessary exchangeInfo call.
+def load_symbol_cache() -> List[str]:
     try:
-        if cache.exists() and time.time() - cache.stat().st_mtime < 7 * 86400:
-            cached = json.loads(cache.read_text())
-            if isinstance(cached, list) and len(cached) >= 100:
-                log.info("Loaded %s symbols from cache", len(cached))
-                return sorted({str(x) for x in cached})
+        if SYMBOL_CACHE_FILE.exists():
+            data = json.loads(SYMBOL_CACHE_FILE.read_text())
+            if isinstance(data, list):
+                return sorted({str(x) for x in data if str(x).endswith("USDT")})
     except Exception as exc:
-        log.warning("Symbol cache read failed: %s", exc)
-
-    while not STOP.is_set():
-        try:
-            data = await rest_get("/fapi/v1/exchangeInfo", attempts=20)
-            symbols = sorted({
-                x["symbol"] for x in data.get("symbols", [])
-                if x.get("contractType") == "PERPETUAL"
-                and x.get("quoteAsset") == "USDT"
-                and x.get("status") == "TRADING"
-            })
-            if symbols:
-                try:
-                    cache.write_text(json.dumps(symbols))
-                except Exception as exc:
-                    log.warning("Symbol cache write failed: %s", exc)
-                return symbols
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.error("exchangeInfo unavailable; retrying in 60s: %s", exc)
-            try:
-                await asyncio.wait_for(STOP.wait(), timeout=60)
-            except asyncio.TimeoutError:
-                pass
+        log.warning("Symbol cache load failed: %s", exc)
     return []
+
+
+def save_symbol_cache() -> None:
+    try:
+        if len(SYMBOL_SET) >= MIN_DISCOVERED_SYMBOLS:
+            SYMBOL_CACHE_FILE.write_text(json.dumps(sorted(SYMBOL_SET)))
+    except Exception as exc:
+        log.warning("Symbol cache save failed: %s", exc)
+
+
+async def symbols_list() -> List[str]:
+    """Discover symbols from the all-market WebSocket; no exchangeInfo startup call."""
+    cached = load_symbol_cache()
+    if cached:
+        SYMBOL_SET.update(cached)
+        log.info("Loaded %s symbols from persistent cache", len(cached))
+    deadline = time.time() + 30
+    while not STOP.is_set() and len(SYMBOL_SET) < MIN_DISCOVERED_SYMBOLS and time.time() < deadline:
+        await asyncio.sleep(0.5)
+    if len(SYMBOL_SET) < MIN_DISCOVERED_SYMBOLS:
+        log.warning("Only %s symbols discovered; waiting without crashing", len(SYMBOL_SET))
+        while not STOP.is_set() and len(SYMBOL_SET) < MIN_DISCOVERED_SYMBOLS:
+            await asyncio.sleep(5)
+    save_symbol_cache()
+    return sorted(SYMBOL_SET)
 
 
 async def fetch_history(symbol: str, tf: str):
@@ -905,53 +920,37 @@ async def history_worker(
 
 
 async def warmup(symbols: List[str]) -> None:
-    """Hydrate states with a fixed worker pool; no thousands of pending tasks."""
-    jobs = [(symbol, tf) for symbol in symbols for tf in TIMEFRAMES]
-    total = len(jobs)
-    queue: asyncio.Queue = asyncio.Queue(maxsize=max(10, HISTORY_WORKERS * 4))
-    result_queue: asyncio.Queue = asyncio.Queue()
-    workers = [
-        asyncio.create_task(
-            history_worker(queue, result_queue, i + 1),
-            name=f"history-worker-{i + 1}",
-        )
-        for i in range(max(1, HISTORY_WORKERS))
-    ]
-
-    async def producer() -> None:
-        for item in jobs:
-            if STOP.is_set():
-                break
-            await queue.put(item)
-        for _ in workers:
-            await queue.put(None)
-
-    producer_task = asyncio.create_task(producer(), name="history-producer")
-    done = loaded = 0
-    log.info(
-        "Warming %s symbol/timeframe states with %s workers...",
-        total, len(workers),
-    )
-    try:
-        while done < total and not STOP.is_set():
-            try:
-                symbol, tf, candles = await asyncio.wait_for(
-                    result_queue.get(), timeout=5
-                )
-            except asyncio.TimeoutError:
-                if producer_task.done() and all(w.done() for w in workers):
-                    break
-                continue
-            done += 1
+    """Progressively hydrate only missing states; never block application startup."""
+    global BOOTSTRAP_DONE, BOOTSTRAP_TOTAL
+    jobs = [(symbol, tf) for symbol in symbols for tf in TIMEFRAMES if key(symbol, tf) not in BUFFERS]
+    BOOTSTRAP_TOTAL = len(jobs)
+    if not jobs:
+        log.info("Warm-up cache complete: %s states already loaded", len(STATES))
+        return
+    log.info("Progressive warm-up started: %s missing states, one request every %.1fs", len(jobs), BOOTSTRAP_GAP_SECONDS)
+    for symbol, tf in jobs:
+        if STOP.is_set():
+            break
+        try:
+            _, _, candles = await fetch_history(symbol, tf)
             if candles:
                 BUFFERS[key(symbol, tf)] = candles
                 STATES[key(symbol, tf)] = rebuild(candles)
-                loaded += 1
-            if done % 50 == 0 or done == total:
-                log.info("Warm-up progress: %s/%s loaded=%s", done, total, loaded)
-    finally:
-        await cancel_tasks([producer_task, *workers])
-    log.info("Warm-up finished loaded=%s failed=%s", loaded, max(0, total - loaded))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Progressive history failed %s %s: %s", symbol, tf, exc)
+        BOOTSTRAP_DONE += 1
+        if BOOTSTRAP_DONE % 20 == 0 or BOOTSTRAP_DONE == BOOTSTRAP_TOTAL:
+            log.info("Progressive warm-up: %s/%s states=%s", BOOTSTRAP_DONE, BOOTSTRAP_TOTAL, len(STATES))
+        if BOOTSTRAP_DONE % 25 == 0:
+            await save_state_cache()
+        try:
+            await asyncio.wait_for(STOP.wait(), timeout=BOOTSTRAP_GAP_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+    await save_state_cache()
+    log.info("Progressive warm-up finished states=%s", len(STATES))
 
 
 async def ws_worker(streams: List[str], wid: int) -> None:
@@ -1100,34 +1099,59 @@ async def process_live_price(symbol: str, price: float) -> None:
 
 
 async def ticker_price_poller() -> None:
-    """Reliable fallback: one REST request returns prices for all futures symbols."""
-    global PRICE_POLL_COUNT, LAST_PRICE_UPDATE_AT
+    """All-market mini ticker WebSocket: discovers symbols and drives live touches without REST."""
+    global PRICE_POLL_COUNT, LAST_PRICE_UPDATE_AT, DISCOVERY_MESSAGES, WS_ERROR_COUNT
+    assert SESSION is not None
     while not STOP.is_set():
-        started = time.monotonic()
         try:
-            rows = await rest_get('/fapi/v1/ticker/price', attempts=5)
-            if isinstance(rows, list):
-                PRICE_POLL_COUNT += 1
-                LAST_PRICE_UPDATE_AT = time.time()
-                for row in rows:
-                    symbol = row.get('symbol')
-                    if symbol and symbol in SYMBOL_SET:
-                        try:
-                            await process_live_price(symbol, float(row['price']))
-                        except (TypeError, ValueError, KeyError):
+            async with SESSION.ws_connect(
+                DISCOVERY_WS,
+                heartbeat=30,
+                receive_timeout=90,
+                autoping=True,
+                autoclose=True,
+                max_msg_size=8_000_000,
+            ) as ws:
+                log.info("Market discovery WebSocket connected")
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        DISCOVERY_MESSAGES += 1
+                        PRICE_POLL_COUNT += 1
+                        LAST_PRICE_UPDATE_AT = time.time()
+                        payload = json.loads(msg.data)
+                        rows = payload.get("data", payload) if isinstance(payload, dict) else payload
+                        if not isinstance(rows, list):
                             continue
-                if PRICE_POLL_COUNT == 1 or PRICE_POLL_COUNT % 30 == 0:
-                    log.info('PRICE POLL polls=%s price_events=%s symbols=%s', PRICE_POLL_COUNT, PRICE_EVENT_COUNT, len(LIVE_PRICES))
+                        for row in rows:
+                            if not isinstance(row, dict):
+                                continue
+                            symbol = str(row.get("s", ""))
+                            if not symbol.endswith("USDT"):
+                                continue
+                            try:
+                                price = float(row.get("c", 0))
+                            except (TypeError, ValueError):
+                                continue
+                            if price <= 0:
+                                continue
+                            was_new = symbol not in SYMBOL_SET
+                            SYMBOL_SET.add(symbol)
+                            await process_live_price(symbol, price)
+                            if was_new and len(SYMBOL_SET) % 25 == 0:
+                                save_symbol_cache()
+                        if DISCOVERY_MESSAGES == 1 or DISCOVERY_MESSAGES % 300 == 0:
+                            log.info("Market stream messages=%s symbols=%s price_events=%s", DISCOVERY_MESSAGES, len(SYMBOL_SET), PRICE_EVENT_COUNT)
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        raise RuntimeError(str(ws.exception()))
+                    elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                        break
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning('Ticker price poll failed: %s', exc)
-
-        delay = max(2.0, 12.0 - (time.monotonic() - started))
-        try:
-            await asyncio.wait_for(STOP.wait(), timeout=delay)
-        except asyncio.TimeoutError:
-            pass
+            WS_ERROR_COUNT += 1
+            log.warning("Market discovery WebSocket disconnected: %s", exc)
+        if not STOP.is_set():
+            await asyncio.sleep(5)
 
 
 def preserve_zone_runtime(old: ZoneState, fresh: ZoneState) -> ZoneState:
@@ -1179,17 +1203,65 @@ async def refresh_one_state(symbol: str, tf: str) -> None:
 
 
 async def candle_refresh_loop(symbols: List[str]) -> None:
-    """Stagger REST candle updates under Binance request limits."""
-    items = [(s, tf) for s in symbols for tf in TIMEFRAMES]
+    """Very slow refresh for already-loaded states; avoids REST bans."""
     index = 0
     while not STOP.is_set():
-        symbol, tf = items[index]
-        index = (index + 1) % len(items)
+        items = [tuple(k.split(":", 1)) for k in list(BUFFERS.keys())]
+        if not items:
+            await asyncio.sleep(10)
+            continue
+        symbol, tf = items[index % len(items)]
+        index += 1
         await refresh_one_state(symbol, tf)
         try:
-            await asyncio.wait_for(STOP.wait(), timeout=1.5)
+            await asyncio.wait_for(STOP.wait(), timeout=CANDLE_REFRESH_SECONDS)
         except asyncio.TimeoutError:
             pass
+
+
+async def save_state_cache() -> None:
+    global CACHE_SAVES
+    try:
+        payload = {
+            "saved_at": time.time(),
+            "buffers": BUFFERS,
+            "states": STATES,
+            "dedup": DEDUP,
+            "last_alert_at": LAST_ALERT_AT,
+        }
+        tmp = STATE_CACHE_PATH.with_suffix(".tmp")
+        with gzip.open(tmp, "wb", compresslevel=5) as fh:
+            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(STATE_CACHE_PATH)
+        CACHE_SAVES += 1
+    except Exception as exc:
+        log.warning("State cache save failed: %s", exc)
+
+
+def load_state_cache() -> None:
+    try:
+        if not STATE_CACHE_PATH.exists():
+            return
+        with gzip.open(STATE_CACHE_PATH, "rb") as fh:
+            payload = pickle.load(fh)
+        buffers = payload.get("buffers", {})
+        states = payload.get("states", {})
+        if isinstance(buffers, dict) and isinstance(states, dict):
+            BUFFERS.update(buffers)
+            STATES.update(states)
+            DEDUP.update(payload.get("dedup", set()))
+            LAST_ALERT_AT.update(payload.get("last_alert_at", {}))
+            log.info("Loaded persistent state cache: buffers=%s states=%s", len(BUFFERS), len(STATES))
+    except Exception as exc:
+        log.warning("State cache load failed; starting progressive bootstrap: %s", exc)
+
+
+async def state_save_loop() -> None:
+    while not STOP.is_set():
+        try:
+            await asyncio.wait_for(STOP.wait(), timeout=STATE_SAVE_SECONDS)
+        except asyncio.TimeoutError:
+            await save_state_cache()
 
 
 async def test_messages(symbol_count: int) -> None:
@@ -1220,8 +1292,14 @@ async def test_messages(symbol_count: int) -> None:
 def stats_payload() -> dict:
     return {
         "ok": True,
-        "version": "v14",
+        "version": "v15-stable",
         "states": len(STATES),
+        "symbols_discovered": len(SYMBOL_SET),
+        "discovery_messages": DISCOVERY_MESSAGES,
+        "bootstrap_done": BOOTSTRAP_DONE,
+        "bootstrap_total": BOOTSTRAP_TOTAL,
+        "cache_saves": CACHE_SAVES,
+        "state_cache_path": str(STATE_CACHE_PATH),
         "raw_ws_messages": RAW_WS_COUNT,
         "ws_errors": WS_ERROR_COUNT,
         "subscription_acks": SUBSCRIPTION_ACK_COUNT,
@@ -1262,7 +1340,7 @@ async def health(_: web.Request) -> web.Response:
 
 async def stats(_: web.Request) -> web.Response:
     data = stats_payload()
-    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v14</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
+    html = f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Ahmed OF Stats</title><style>body{{font-family:Arial;background:#111;color:#eee;padding:24px}}.card{{max-width:700px;margin:auto;background:#1d1d1d;padding:22px;border-radius:14px}}h1{{font-size:22px}}pre{{white-space:pre-wrap;line-height:1.8;background:#0b0b0b;padding:16px;border-radius:10px}}</style></head><body><div class='card'><h1>Ahmed Order Flow Intelligence Pro v15 Stable</h1><pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre></div></body></html>"""
     return web.Response(text=html, content_type="text/html")
 
 
@@ -1303,29 +1381,37 @@ async def main() -> None:
     try:
         if not BOT_TOKEN or not CHAT_ID:
             log.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+
+        load_state_cache()
+        cached_symbols = load_symbol_cache()
+        SYMBOL_SET.update(cached_symbols)
+
+        # Start live market discovery first; the service never blocks on REST warm-up.
+        discovery_task = asyncio.create_task(ticker_price_poller(), name="market-discovery")
+        managed_tasks.append(discovery_task)
+        managed_tasks.append(asyncio.create_task(state_save_loop(), name="state-save"))
+        managed_tasks.append(asyncio.create_task(heartbeat(), name="heartbeat"))
+
         symbols = await symbols_list()
         if not symbols:
-            log.error("No symbols available; stopping cleanly")
+            log.error("No symbols discovered; keeping health server alive")
+            await STOP.wait()
             return
-        SYMBOL_SET = set(symbols)
-        log.info("Found %s active USDT perpetual contracts", len(symbols))
-        await warmup(symbols)
-        if STOP.is_set():
-            return
-        active_bull = sum(1 for st in STATES.values() if not st.bull_broken and st.bull_top is not None)
-        active_bear = sum(1 for st in STATES.values() if not st.bear_broken and st.bear_top is not None)
-        log.info("Warm-up active zones: bull=%s bear=%s", active_bull, active_bear)
+        log.info("Discovered %s USDT futures symbols", len(symbols))
         await test_messages(len(symbols))
-        streams = [f"{s.lower()}@kline_{tf}" for s in symbols for tf in TIMEFRAMES]
+
+        # Kline streams are supplemental; live touch detection already runs from mini tickers.
+        streams = [f"{sym.lower()}@kline_{tf}" for sym in symbols for tf in TIMEFRAMES]
         chunks = [streams[i:i + STREAMS_PER_WS] for i in range(0, len(streams), STREAMS_PER_WS)]
-        log.info("Starting %s WebSocket connections", len(chunks))
         managed_tasks.extend(
             asyncio.create_task(ws_worker(chunk, i + 1), name=f"ws-{i + 1}")
             for i, chunk in enumerate(chunks)
         )
-        managed_tasks.append(asyncio.create_task(ticker_price_poller(), name="ticker-poller"))
+
+        # REST jobs are progressive and non-blocking; a 418 pause cannot stop the bot.
+        managed_tasks.append(asyncio.create_task(warmup(symbols), name="progressive-warmup"))
         managed_tasks.append(asyncio.create_task(candle_refresh_loop(symbols), name="candle-refresh"))
-        managed_tasks.append(asyncio.create_task(heartbeat(), name="heartbeat"))
+
         await STOP.wait()
     except asyncio.CancelledError:
         STOP.set()
@@ -1335,6 +1421,8 @@ async def main() -> None:
         STOP.set()
     finally:
         STOP.set()
+        await save_state_cache()
+        save_symbol_cache()
         await cancel_tasks(managed_tasks)
         await cancel_tasks(list(BACKGROUND_TASKS))
         await runner.cleanup()
