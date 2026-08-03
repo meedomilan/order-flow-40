@@ -1,19 +1,16 @@
-Ahmed Order Flow Intelligence Pro v15 Stable
+Ahmed Order Flow Intelligence Pro v14
 
-Railway variables:
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=-100...
-MIN_SCORE=75
-FIRST_LIVE_TOUCH_ONLY=true
-SEND_TEST_MESSAGES=false
-STATE_DIR=/data
-BOOTSTRAP_GAP_SECONDS=3.5
-CANDLE_REFRESH_SECONDS=15
-STATE_SAVE_SECONDS=60
-REST_MIN_INTERVAL=2.5
-REST_CONCURRENCY=1
-HISTORY_WORKERS=1
+التغييرات:
+- سقف واقعي للتقييم عند غياب Sweep أو Absorption أو POC.
+- Delta وCVD بوابة أساسية افتراضيًا قبل إرسال التنبيه.
+- إضافة الثقة المؤسسية منفصلة عن Score داخل رسالة Telegram.
+- الحفاظ على Queue + Workers وإصلاحات الاستقرار من V13.2.
 
-IMPORTANT: Add a Railway persistent Volume mounted at /data.
-This prevents the bot from downloading all historical candles after every redeploy.
-The service starts WebSocket price discovery immediately and hydrates missing history progressively.
+متغيرات Railway الجديدة/المهمة:
+REQUIRE_DELTA_CVD=true
+SCORE_CAP_NO_SWEEP=89
+SCORE_CAP_NO_ABSORPTION=84
+SCORE_CAP_NO_POC=82
+HISTORY_WORKERS=2
+
+يمكن إبقاء بقية متغيرات V13.2 كما هي.
